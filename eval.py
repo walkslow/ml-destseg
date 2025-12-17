@@ -45,8 +45,11 @@ def evaluate(args, category, model, visualizer, global_step=0):
             img = sample_batched["img"].cuda()
             mask = sample_batched["mask"].to(torch.int64).cuda()
 
+            # 像素级异常检测指标
             output_segmentation, output_de_st, output_de_st_list = model(img)
 
+            # 与训练时相反，测试时将output_segmentation 插值到 mask 尺寸
+            # 获得与原始标签相同分辨率的预测结果，确保评估指标计算的准确性
             output_segmentation = F.interpolate(
                 output_segmentation,
                 size=mask.size()[2:],
@@ -57,24 +60,36 @@ def evaluate(args, category, model, visualizer, global_step=0):
                 output_de_st, size=mask.size()[2:], mode="bilinear", align_corners=False
             )
 
+            # 图像级异常检测指标
+            # mask.size(0)返回维度N的大小，mask.view(mask.size(0), -1)改变mask的形状为(N,H*W)，-1自动推断为(H*W)
+            # torch.max(..., dim=1)在 第 1 维（即每个样本的像素维度）上求最大值，返回一个元组 (values, indices)
+            # [0]表示只取 values，丢弃 indices。最终 mask_sample 是一个长度为 N 的一维张量，表示每个样本是否有异常。
             mask_sample = torch.max(mask.view(mask.size(0), -1), dim=1)[0]
+            # 对每个样本的预测异常分数的所有像素值进行降序排序，便于后续取 top-k 异常响应或计算统计量
+            # torch.sort(..., dim=1, descending=True)返回(sorted_values, sorted_indices)
+            # output_segmentation_sample为sorted_values，sorted_values[i]表示第 i 个样本的所有像素异常分数，降序排列
             output_segmentation_sample, _ = torch.sort(
                 output_segmentation.view(output_segmentation.size(0), -1),
                 dim=1,
                 descending=True,
             )
+            # 在 dim=1（即 T 个分数的维度）上求平均，表示这张图像的异常程度 = 其最可疑的 T 个像素的平均异常分数
             output_segmentation_sample = torch.mean(
                 output_segmentation_sample[:, : args.T], dim=1
             )
+            # 下面操作类似。最终 output_de_st_sample 形状为 (N,)，表示每个样本基于学生-教师网络的图像级异常得分
             output_de_st_sample, _ = torch.sort(
                 output_de_st.view(output_de_st.size(0), -1), dim=1, descending=True
             )
             output_de_st_sample = torch.mean(output_de_st_sample[:, : args.T], dim=1)
 
+            # 像素级指标（输入为 4D 张量）：IAPS和AUPRO指标不能 flatten，因为需要空间信息
             de_st_IAPS.update(output_de_st, mask)
             de_st_AUPRO.update(output_de_st, mask)
+            # 像素级指标（输入为 1D 向量）：AP和AUROC指标需要 flatten 为向量形式
             de_st_AP.update(output_de_st.flatten(), mask.flatten())
             de_st_AUROC.update(output_de_st.flatten(), mask.flatten())
+            # 图像级 AUROC
             de_st_detect_AUROC.update(output_de_st_sample, mask_sample)
 
             seg_IAPS.update(output_segmentation, mask)
@@ -158,6 +173,7 @@ def test(args, category):
     assert os.path.exists(
         os.path.join(args.checkpoint_path, args.base_model_name + category + ".pckl")
     )
+    # 加载训练好的模型权重
     model.load_state_dict(
         torch.load(
             os.path.join(
