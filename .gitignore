@@ -133,5 +133,7 @@ saved_model
 datasets
 .out
 logs
+offline_packages
+vis
 
 .vscode
