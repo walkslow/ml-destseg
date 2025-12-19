@@ -1,4 +1,5 @@
 anomalib==0.4.0
+tensorboard
 imgaug==0.4.0
 matplotlib==3.7.1
 numpy==1.24.2
