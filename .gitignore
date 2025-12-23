@@ -135,5 +135,6 @@ datasets
 logs
 offline_packages
 vis
+test_*.py
 
 .vscode
