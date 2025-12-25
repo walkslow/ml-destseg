@@ -24,11 +24,12 @@ from model.destseg import DeSTSeg
 # Metrics
 from model.metrics import MulticlassSegmentationMetrics, MulticlassAUPRO
 from visualize import save_metric_plots
+from draw import save_visual_comparison
 
 warnings.filterwarnings("ignore")
 
 
-def evaluate(args, model, visualizer, global_step=0):
+def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save_dir=None, vis_num_images=4):
     model.eval()
     
     device = next(model.parameters()).device
@@ -47,6 +48,11 @@ def evaluate(args, model, visualizer, global_step=0):
         num_classes=args.num_classes, 
         ignore_index=0
     ).to(device)
+
+    # Visualization accumulation
+    vis_imgs_accum = []
+    vis_gt_accum = []
+    vis_pred_accum = []
 
     with torch.no_grad():
         print(f"Loading test data from: {args.rod_dir}")
@@ -99,6 +105,38 @@ def evaluate(args, model, visualizer, global_step=0):
             # MulticlassAUPRO 需要概率图，所以先做 Softmax
             probs = torch.softmax(output_segmentation, dim=1)
             aupro_metric.update(probs, mask)
+            
+            # --- Advanced Visualization (Accumulation) ---
+            if vis_gt_pred and len(vis_imgs_accum) < vis_num_images:
+                batch_size = img_origin_l.shape[0]
+                remaining = vis_num_images - len(vis_imgs_accum)
+                num_to_take = min(batch_size, remaining)
+                
+                # Append to lists (keep as tensors on CPU to save GPU memory if needed, or keep on device)
+                # save_visual_comparison expects list of tensors.
+                for i in range(num_to_take):
+                    vis_imgs_accum.append(img_origin_l[i].cpu())
+                    vis_gt_accum.append(mask[i].cpu())
+                    
+                    # Prediction
+                    pred_mask = torch.argmax(output_segmentation[i], dim=0) # (H, W)
+                    vis_pred_accum.append(pred_mask.cpu())
+
+        # --- Generate Visualization if accumulated ---
+        if vis_gt_pred and vis_save_dir and len(vis_imgs_accum) > 0:
+            print(f"--- Generating Visualization for {len(vis_imgs_accum)} images ---")
+            
+            # Use global_step for filename as requested
+            pred_filename = f"pred_step_{global_step}.png"
+            pred_save_path = os.path.join(vis_save_dir, pred_filename)
+            save_visual_comparison(vis_imgs_accum, vis_pred_accum, pred_save_path, nrow=int(vis_num_images**0.5) if vis_num_images > 1 else 1)
+            
+            # Save GT only once if it doesn't exist
+            gt_save_path = os.path.join(vis_save_dir, "gt.png")
+            if not os.path.exists(gt_save_path):
+                 save_visual_comparison(vis_imgs_accum, vis_gt_accum, gt_save_path, nrow=int(vis_num_images**0.5) if vis_num_images > 1 else 1)
+            
+            print(f"Saved visualization to {vis_save_dir}")
 
         # --- 计算并打印结果 ---
         results = seg_metrics.compute()
