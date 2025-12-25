@@ -2,212 +2,216 @@ import argparse
 import os
 import shutil
 import warnings
-
+from datetime import datetime
 import torch
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
-from torchmetrics import AUROC, AveragePrecision
 
-from constant import RESIZE_SHAPE, NORMALIZE_MEAN, NORMALIZE_STD, ALL_CATEGORY
-from data.mvtec_dataset import MVTecDataset
+# Constants
+from constant import (
+    RESIZE_SHAPE, 
+    NORMALIZE_MEAN_L, 
+    NORMALIZE_STD_L, 
+    NORMALIZE_MEAN_RGB, 
+    NORMALIZE_STD_RGB
+)
+
+# Dataset & Model
+from data.rod_dataset import RodDataset
 from model.destseg import DeSTSeg
-from model.metrics import AUPRO, IAPS
+
+# Metrics
+from model.metrics import MulticlassSegmentationMetrics, MulticlassAUPRO
+from visualize import save_metric_plots
 
 warnings.filterwarnings("ignore")
 
 
-def evaluate(args, category, model, visualizer, global_step=0):
+def evaluate(args, model, visualizer, global_step=0):
     model.eval()
+    
+    device = next(model.parameters()).device
+
+    # 初始化多分类分割指标计算器
+    # 假设类别 0 是背景，通常在计算 mIoU 时会关心背景，但在某些异常检测设定下可能忽略
+    # 这里默认计算所有类别，如果需要忽略背景，设置 ignore_index=0
+    seg_metrics = MulticlassSegmentationMetrics(
+        num_classes=args.num_classes, 
+        ignore_index=None  # 或者 args.ignore_index
+    ).to(device)
+    
+    # 初始化多分类 AUPRO 指标 (One-vs-Rest)
+    # AUPRO 通常忽略背景类 (index 0)
+    aupro_metric = MulticlassAUPRO(
+        num_classes=args.num_classes, 
+        ignore_index=0
+    ).to(device)
+
     with torch.no_grad():
-        dataset = MVTecDataset(
+        print(f"Loading test data from: {args.rod_dir}")
+        dataset = RodDataset(
             is_train=False,
-            mvtec_dir=args.mvtec_path + category + "/test/",
+            rod_dir=args.rod_dir,
             resize_shape=RESIZE_SHAPE,
-            normalize_mean=NORMALIZE_MEAN,
-            normalize_std=NORMALIZE_STD,
+            normalize_mean_l=NORMALIZE_MEAN_L,
+            normalize_std_l=NORMALIZE_STD_L,
+            normalize_mean_rgb=NORMALIZE_MEAN_RGB,
+            normalize_std_rgb=NORMALIZE_STD_RGB,
         )
         dataloader = DataLoader(
             dataset, batch_size=args.bs, shuffle=False, num_workers=args.num_workers
         )
-        de_st_IAPS = IAPS().cuda()
-        de_st_AUPRO = AUPRO().cuda()
-        de_st_AUROC = AUROC().cuda()
-        de_st_AP = AveragePrecision().cuda()
-        de_st_detect_AUROC = AUROC().cuda()
-        seg_IAPS = IAPS().cuda()
-        seg_AUPRO = AUPRO().cuda()
-        seg_AUROC = AUROC().cuda()
-        seg_AP = AveragePrecision().cuda()
-        seg_detect_AUROC = AUROC().cuda()
 
         for _, sample_batched in enumerate(dataloader):
-            img = sample_batched["img"].cuda()
-            mask = sample_batched["mask"].to(torch.int64).cuda()
+            # 获取输入数据 (移动到设备)
+            img_aug_l = sample_batched["img_aug_l"].to(device)     # 学生网络输入 (灰度)
+            img_aug_rgb = sample_batched["img_aug_rgb"].to(device) # 教师网络输入 (RGB)
+            img_origin_l = sample_batched["img_origin_l"].to(device)
+            img_origin_rgb = sample_batched["img_origin_rgb"].to(device)
+            mask = sample_batched["mask"].to(torch.int64).to(device)
 
-            # 像素级异常检测指标
-            output_segmentation, output_de_st, output_de_st_list = model(img)
-
-            # 与训练时相反，测试时将output_segmentation 插值到 mask 尺寸
-            # 获得与原始标签相同分辨率的预测结果，确保评估指标计算的准确性
-            output_segmentation = F.interpolate(
-                output_segmentation,
-                size=mask.size()[2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            output_de_st = F.interpolate(
-                output_de_st, size=mask.size()[2:], mode="bilinear", align_corners=False
+            # 模型前向传播
+            # 注意：测试模式下 img_aug 和 img_origin 是一样的，但 DeSTSeg 接口需要传入
+            output_segmentation, _, _ = model(
+                img_aug_l, img_aug_rgb, img_origin_l, img_origin_rgb
             )
 
-            # 图像级异常检测指标
-            # mask.size(0)返回维度N的大小，mask.view(mask.size(0), -1)改变mask的形状为(N,H*W)，-1自动推断为(H*W)
-            # torch.max(..., dim=1)在 第 1 维（即每个样本的像素维度）上求最大值，返回一个元组 (values, indices)
-            # [0]表示只取 values，丢弃 indices。最终 mask_sample 是一个长度为 N 的一维张量，表示每个样本是否有异常。
-            mask_sample = torch.max(mask.view(mask.size(0), -1), dim=1)[0]
-            # 对每个样本的预测异常分数的所有像素值进行降序排序，便于后续取 top-k 异常响应或计算统计量
-            # torch.sort(..., dim=1, descending=True)返回(sorted_values, sorted_indices)
-            # output_segmentation_sample为sorted_values，sorted_values[i]表示第 i 个样本的所有像素异常分数，降序排列
-            output_segmentation_sample, _ = torch.sort(
-                output_segmentation.view(output_segmentation.size(0), -1),
-                dim=1,
-                descending=True,
-            )
-            # 在 dim=1（即 T 个分数的维度）上求平均，表示这张图像的异常程度 = 其最可疑的 T 个像素的平均异常分数
-            output_segmentation_sample = torch.mean(
-                output_segmentation_sample[:, : args.T], dim=1
-            )
-            # 下面操作类似。最终 output_de_st_sample 形状为 (N,)，表示每个样本基于学生-教师网络的图像级异常得分
-            output_de_st_sample, _ = torch.sort(
-                output_de_st.view(output_de_st.size(0), -1), dim=1, descending=True
-            )
-            output_de_st_sample = torch.mean(output_de_st_sample[:, : args.T], dim=1)
+            # 将预测结果插值到原始 mask 尺寸 (如果 mask 尺寸与模型输出不同)
+            # RodDataset 的 mask 已经在预处理时 resize 到了 RESIZE_SHAPE
+            # DeSTSeg 输出的 output_segmentation 也是 RESIZE_SHAPE (因为输入是 RESIZE_SHAPE)
+            # 但为了保险起见，或者如果 mask 是原始分辨率，这里做一次插值
+            if output_segmentation.shape[-2:] != mask.shape[-2:]:
+                output_segmentation = F.interpolate(
+                    output_segmentation,
+                    size=mask.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
-            # 像素级指标（输入为 4D 张量）：IAPS和AUPRO指标不能 flatten，因为需要空间信息
-            de_st_IAPS.update(output_de_st, mask)
-            de_st_AUPRO.update(output_de_st, mask)
-            # 像素级指标（输入为 1D 向量）：AP和AUROC指标需要 flatten 为向量形式
-            de_st_AP.update(output_de_st.flatten(), mask.flatten())
-            de_st_AUROC.update(output_de_st.flatten(), mask.flatten())
-            # 图像级 AUROC
-            de_st_detect_AUROC.update(output_de_st_sample, mask_sample)
+            # --- 更新指标 ---
+            
+            # 1. 分割指标 (mIoU, Dice, etc.)
+            # MulticlassSegmentationMetrics 内部会自动对 (B, C, H, W) 进行 argmax
+            seg_metrics.update(output_segmentation, mask)
+            
+            # 2. 异常检测指标 (AUPRO)
+            # MulticlassAUPRO 需要概率图，所以先做 Softmax
+            probs = torch.softmax(output_segmentation, dim=1)
+            aupro_metric.update(probs, mask)
 
-            seg_IAPS.update(output_segmentation, mask)
-            seg_AUPRO.update(output_segmentation, mask)
-            seg_AP.update(output_segmentation.flatten(), mask.flatten())
-            seg_AUROC.update(output_segmentation.flatten(), mask.flatten())
-            seg_detect_AUROC.update(output_segmentation_sample, mask_sample)
+        # --- 计算并打印结果 ---
+        results = seg_metrics.compute()
+        aupro_score = aupro_metric.compute()
+        
+        # 提取标量值
+        mIoU = results["mIoU"].item()
+        mDice = results["mDice"].item()
+        mFscore = results["mFscore"].item()
+        
+        # 记录到 TensorBoard
+        if visualizer:
+            visualizer.add_scalar("Eval/mIoU", mIoU, global_step)
+            visualizer.add_scalar("Eval/mDice", mDice, global_step)
+            visualizer.add_scalar("Eval/mFscore", mFscore, global_step)
+            visualizer.add_scalar("Eval/AUPRO", aupro_score.item(), global_step)
 
-        iap_de_st, iap90_de_st = de_st_IAPS.compute()
-        aupro_de_st, ap_de_st, auc_de_st, auc_detect_de_st = (
-            de_st_AUPRO.compute(),
-            de_st_AP.compute(),
-            de_st_AUROC.compute(),
-            de_st_detect_AUROC.compute(),
-        )
-        iap_seg, iap90_seg = seg_IAPS.compute()
-        aupro_seg, ap_seg, auc_seg, auc_detect_seg = (
-            seg_AUPRO.compute(),
-            seg_AP.compute(),
-            seg_AUROC.compute(),
-            seg_detect_AUROC.compute(),
-        )
-
-        visualizer.add_scalar("DeST_IAP", iap_de_st, global_step)
-        visualizer.add_scalar("DeST_IAP90", iap90_de_st, global_step)
-        visualizer.add_scalar("DeST_AUPRO", aupro_de_st, global_step)
-        visualizer.add_scalar("DeST_AP", ap_de_st, global_step)
-        visualizer.add_scalar("DeST_AUC", auc_de_st, global_step)
-        visualizer.add_scalar("DeST_detect_AUC", auc_detect_de_st, global_step)
-
-        visualizer.add_scalar("DeSTSeg_IAP", iap_seg, global_step)
-        visualizer.add_scalar("DeSTSeg_IAP90", iap90_seg, global_step)
-        visualizer.add_scalar("DeSTSeg_AUPRO", aupro_seg, global_step)
-        visualizer.add_scalar("DeSTSeg_AP", ap_seg, global_step)
-        visualizer.add_scalar("DeSTSeg_AUC", auc_seg, global_step)
-        visualizer.add_scalar("DeSTSeg_detect_AUC", auc_detect_seg, global_step)
-
-        print("Eval at step", global_step)
+        print(f"Eval at step {global_step}")
         print("================================")
-        print("Denoising Student-Teacher (DeST)")
-        print("pixel_AUC:", round(float(auc_de_st), 4))
-        print("pixel_AP:", round(float(ap_de_st), 4))
-        print("PRO:", round(float(aupro_de_st), 4))
-        print("image_AUC:", round(float(auc_detect_de_st), 4))
-        print("IAP:", round(float(iap_de_st), 4))
-        print("IAP90:", round(float(iap90_de_st), 4))
-        print()
-        print("Segmentation Guided Denoising Student-Teacher (DeSTSeg)")
-        print("pixel_AUC:", round(float(auc_seg), 4))
-        print("pixel_AP:", round(float(ap_seg), 4))
-        print("PRO:", round(float(aupro_seg), 4))
-        print("image_AUC:", round(float(auc_detect_seg), 4))
-        print("IAP:", round(float(iap_seg), 4))
-        print("IAP90:", round(float(iap90_seg), 4))
-        print()
+        print(f"mIoU:    {mIoU:.4f}")
+        print(f"mDice:   {mDice:.4f}")
+        print(f"mFscore: {mFscore:.4f}")
+        print(f"AUPRO:   {aupro_score.item():.4f}")
+        print("--------------------------------")
+        print("Per-class IoU:", results["per_class_IoU"].cpu().numpy())
+        print("================================")
+        
+        # 清理状态
+        seg_metrics.reset()
+        aupro_metric.reset()
 
-        de_st_IAPS.reset()
-        de_st_AUPRO.reset()
-        de_st_AUROC.reset()
-        de_st_AP.reset()
-        de_st_detect_AUROC.reset()
-        seg_IAPS.reset()
-        seg_AUPRO.reset()
-        seg_AUROC.reset()
-        seg_AP.reset()
-        seg_detect_AUROC.reset()
+        return {
+            "mIoU": mIoU,
+            "mDice": mDice,
+            "mFscore": mFscore,
+            "AUPRO": aupro_score.item()
+        }
 
 
-def test(args, category):
+def test(args):
+    start_time = datetime.now()
+    print(f"--- 测试开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+
+    # 确定计算设备
+    if torch.cuda.is_available() and args.gpu_id >= 0:
+        device = torch.device(f"cuda:{args.gpu_id}")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
+
     if not os.path.exists(args.log_path):
         os.makedirs(args.log_path)
+    
+    # 确定 checkpoint 路径
+    ckpt_path = os.path.join(args.checkpoint_path, args.base_model_name + ".pckl")
+    if not os.path.exists(ckpt_path):
+        # 尝试不带 .pckl 后缀或其他命名格式，或者直接使用 args.checkpoint_path 如果它是文件
+        if os.path.isfile(args.checkpoint_path):
+            ckpt_path = args.checkpoint_path
+        else:
+            print(f"Error: Checkpoint not found at {ckpt_path}")
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+            
+    # 从 checkpoint 文件名生成 run_name
+    # 获取文件名（不带路径）
+    ckpt_filename = os.path.basename(ckpt_path)
+    # 去掉后缀名
+    ckpt_name_no_ext = os.path.splitext(ckpt_filename)[0]
+    
+    run_name = f"Test_{ckpt_name_no_ext}"
+    log_dir = os.path.join(args.log_path, run_name)
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
 
-    run_name = f"DeSTSeg_MVTec_test_{category}"
-    if os.path.exists(os.path.join(args.log_path, run_name + "/")):
-        shutil.rmtree(os.path.join(args.log_path, run_name + "/"))
+    visualizer = SummaryWriter(log_dir=log_dir)
 
-    visualizer = SummaryWriter(log_dir=os.path.join(args.log_path, run_name + "/"))
+    # 初始化模型并移动到指定设备
+    model = DeSTSeg(dest=True, ed=True, num_classes=args.num_classes).to(device)
 
-    model = DeSTSeg(dest=True, ed=True).cuda()
+    print(f"Loading checkpoint: {ckpt_path}")
+    # 这里的 map_location 确保权重能加载到正确的设备上（即使用户在 CPU 机器上加载 GPU 训练的权重）
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    
+    evaluate(args, model, visualizer)
 
-    assert os.path.exists(
-        os.path.join(args.checkpoint_path, args.base_model_name + category + ".pckl")
-    )
-    # 加载训练好的模型权重
-    model.load_state_dict(
-        torch.load(
-            os.path.join(
-                args.checkpoint_path, args.base_model_name + category + ".pckl"
-            )
-        )
-    )
+    # --- 自动绘制并保存 Loss/Metric 曲线 ---
+    print("--- 正在绘制并保存评估指标曲线 ---")
+    vis_save_dir = os.path.join(args.vis_path, run_name)
+    save_metric_plots(log_dir, vis_save_dir)
 
-    evaluate(args, category, model, visualizer)
+    end_time = datetime.now()
+    duration = end_time - start_time
+    print(f"--- 测试结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+    print(f"--- 测试总时长: {duration} ---")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--gpu_id", type=int, default=0)
-    parser.add_argument("--num_workers", type=int, default=16)
+    parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use. Set to -1 for CPU.")
+    parser.add_argument("--num_workers", type=int, default=4)
+    
+    # 路径参数
+    parser.add_argument("--rod_dir", type=str, required=True, help="Path to test images directory")
+    parser.add_argument("--checkpoint_path", type=str, default="./saved_model/", help="Path to model checkpoint")
+    parser.add_argument("--base_model_name", type=str, default="DeSTSeg_Rod_Best", help="Model filename prefix")
+    parser.add_argument("--log_path", type=str, default="./logs/", help="Tensorboard log directory")
+    parser.add_argument("--vis_path", type=str, default="./vis/", help="Path to save visualization plots")
 
-    parser.add_argument("--mvtec_path", type=str, default="./datasets/mvtec/")
-    parser.add_argument("--dtd_path", type=str, default="./datasets/dtd/images/")
-    parser.add_argument("--checkpoint_path", type=str, default="./saved_model/")
-    parser.add_argument("--base_model_name", type=str, default="DeSTSeg_MVTec_5000_")
-    parser.add_argument("--log_path", type=str, default="./logs/")
+    # 模型参数
+    parser.add_argument("--bs", type=int, default=16, help="Batch size")
+    parser.add_argument("--num_classes", type=int, default=4, help="Number of classes (including background)")
 
-    parser.add_argument("--bs", type=int, default=32)
-    parser.add_argument("--T", type=int, default=100)  # for image-level inference
-
-    parser.add_argument("--category", nargs="*", type=str, default=ALL_CATEGORY)
     args = parser.parse_args()
 
-    obj_list = args.category
-    for obj in obj_list:
-        assert obj in ALL_CATEGORY
-
-    with torch.cuda.device(args.gpu_id):
-        for obj in obj_list:
-            print(obj)
-            test(args, obj)
+    test(args)
