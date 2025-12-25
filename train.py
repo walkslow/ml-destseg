@@ -234,8 +234,36 @@ def train(args):
                 eval_args = copy.copy(args)
                 eval_args.rod_dir = args.test_dir
                 try:
+                    # Calculate total number of evaluations
+                    total_evals = args.steps // args.eval_per_steps
+                    current_eval_idx = global_step // args.eval_per_steps
+                    
+                    # Determine if we should visualize this step
+                    should_vis = False
+                    if args.vis_steps:
+                         target_indices = set()
+                         for s in args.vis_steps:
+                             if s == 0: continue
+                             if s > 0:
+                                 target_indices.add(s)
+                             else:
+                                 # e.g. total=5, s=-1 -> 5. s=-2 -> 4.
+                                 target_indices.add(total_evals + 1 + s)
+                         
+                         if current_eval_idx in target_indices:
+                             should_vis = True
+                    
+                    vis_save_dir = None
+                    if should_vis:
+                        vis_save_dir = os.path.join(args.vis_path, run_name, "gt_vs_pred")
+                        if not os.path.exists(vis_save_dir):
+                            os.makedirs(vis_save_dir)
+
                     # evaluate 现在返回指标字典
-                    metrics = evaluate(eval_args, model, visualizer, global_step)
+                    metrics = evaluate(eval_args, model, visualizer, global_step,
+                                       vis_gt_pred=should_vis,
+                                       vis_save_dir=vis_save_dir,
+                                       vis_num_images=args.vis_num_images)
                     
                     # 仅在第二阶段 (分割训练) 跟踪最佳分割模型
                     if global_step > args.de_st_steps:
@@ -307,8 +335,8 @@ def train(args):
 
     # --- 9. 自动绘制并保存 Loss/Metric 曲线 ---
     print("--- 正在绘制并保存 Loss 和评估指标曲线 ---")
-    # 最终保存的目录是 args.vis_path/run_name
-    vis_save_dir = os.path.join(args.vis_path, run_name)
+    # 最终保存的目录是 args.vis_path/run_name/metrics
+    vis_save_dir = os.path.join(args.vis_path, run_name, "metrics")
     save_metric_plots(log_dir, vis_save_dir)
 
 
@@ -338,6 +366,8 @@ if __name__ == "__main__":
     parser.add_argument("--run_name_head", type=str, default="DeSTSeg_ROD", help="运行名称的前缀")
     parser.add_argument("--log_path", type=str, default="./logs/", help="保存TensorBoard日志的路径")
     parser.add_argument("--vis_path", type=str, default="./vis/", help="保存可视化图表的路径")
+    parser.add_argument("--vis_steps", type=int, nargs='+', default=[1, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
+    parser.add_argument("--vis_num_images", type=int, default=4, help="每次详细可视化时保存的图像数量")
     parser.add_argument("--num_classes", type=int, default=4, help="类别数量")
 
     # -- 训练超参数 --
