@@ -4,6 +4,7 @@ import argparse
 import os
 import shutil
 import warnings
+import copy
 from datetime import datetime
 
 # 导入PyTorch核心包
@@ -15,9 +16,10 @@ from torch.utils.data import DataLoader
 # 导入项目自定义模块
 from constant import RESIZE_SHAPE, NORMALIZE_MEAN_L, NORMALIZE_STD_L, NORMALIZE_MEAN_RGB, NORMALIZE_STD_RGB
 from data.rod_dataset import RodDataset
-# from eval import evaluate # 评估函数，当前版本中未使用，注释备用
+from eval import evaluate # 评估函数
 from model.destseg import DeSTSeg
 from model.losses import cosine_similarity_loss, focal_loss, dice_loss
+from visualize import save_metric_plots
 
 # 忽略不必要的警告信息，保持输出整洁
 warnings.filterwarnings("ignore")
@@ -30,6 +32,9 @@ def train(args):
     到执行核心训练循环、计算损失、反向传播和模型保存的全过程。
     :param args: 命令行传入的参数对象
     """
+    start_time = datetime.now()
+    print(f"--- 训练开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+
     # --- 1. 初始化和环境设置 ---
     # 自动检测可用的CUDA设备，如果无可用GPU，则自动切换到CPU。这种设计增强了代码的设备兼容性。
     # 使用f-string动态构建设备字符串，例如 "cuda:0"
@@ -58,11 +63,11 @@ def train(args):
 
     # --- 3. 模型初始化 ---
     # 实例化DeSTSeg模型。
-    # num_classes=4: 设置为4分类任务（背景, 划痕, 凹痕, 点状缺陷）。
+    # num_classes: 设置为分类任务的类别数，包括背景。
     # dest=True: 启用student-teacher模式，学生网络将使用数据增强后的图像。
     # ed=True: 学生网络将包含一个解码器结构。
     # .to(device): 将模型的所有参数和缓冲区移动到先前选定的设备（GPU或CPU）。
-    model = DeSTSeg(num_classes=4, dest=True, ed=True).to(device)
+    model = DeSTSeg(num_classes=args.num_classes, dest=True, ed=True).to(device)
 
     # --- 4. 优化器设置 ---
     # 采用两阶段训练策略，因此需要为学生网络和分割网络分别设置优化器。
@@ -123,6 +128,12 @@ def train(args):
     # --- 6. 训练主循环 ---
     global_step = 0  # 初始化全局步数计数器，用于精确控制训练总长度
     flag = True      # 训练循环的控制标志
+
+    # 最佳模型跟踪
+    best_st_loss = float('inf')
+    best_seg_metric = float('-inf')
+    best_st_state_path = os.path.join(args.checkpoint_path, f"{run_name}_best_st.pckl")
+    best_seg_state_path = os.path.join(args.checkpoint_path, f"{run_name}_best_seg.pckl")
 
     # 使用 "while" 循环和 "global_step" 实现基于步数（step-based）的训练，
     # 而非传统的基于轮次（epoch-based）的训练。这在需要精确控制迭代次数的场景中非常有用，适用于对比学习/自监督学习/大规模预训练
@@ -187,12 +198,27 @@ def train(args):
                 total_loss_val = cosine_loss_val
                 total_loss_val.backward()  # 计算梯度
                 de_st_optimizer.step()     # 更新学生网络的权重
+                
+                # 跟踪最佳 S-T 模型 (基于 Cosine Loss)
+                if cosine_loss_val < best_st_loss:
+                    best_st_loss = cosine_loss_val
+                    torch.save(model.state_dict(), best_st_state_path)
+
             else:
                 total_loss_val = focal_loss_val + dice_loss_val
                 total_loss_val.backward()  # 计算梯度
                 seg_optimizer.step()       # 更新分割网络的权重
 
             global_step += 1 # 更新全局步数
+
+            # --- 阶段切换：加载最佳 S-T 模型 ---
+            if global_step == args.de_st_steps:
+                if os.path.exists(best_st_state_path):
+                    print(f"--- [Phase Switch] Loading best S-T model (Loss: {best_st_loss:.6f}) for Segmentation training ---")
+                    # 加载参数
+                    model.load_state_dict(torch.load(best_st_state_path))
+                    # 重新将模型放到设备上 (以防万一)
+                    model.to(device)
 
             # --- 7. 日志记录和可视化 ---
             # 使用visualizer将各项损失值写入TensorBoard，方便后续分析和可视化。
@@ -203,8 +229,33 @@ def train(args):
             visualizer.add_scalar("Loss/Total_Loss", total_loss_val, global_step)
 
             # 定期评估模型性能
-            # if global_step % args.eval_per_steps == 0:
-            #     evaluate(args, category, model, visualizer, global_step)
+            if global_step % args.eval_per_steps == 0 and args.test_dir:
+                print(f"--- Running evaluation at step {global_step} ---")
+                eval_args = copy.copy(args)
+                eval_args.rod_dir = args.test_dir
+                try:
+                    # evaluate 现在返回指标字典
+                    metrics = evaluate(eval_args, model, visualizer, global_step)
+                    
+                    # 仅在第二阶段 (分割训练) 跟踪最佳分割模型
+                    if global_step > args.de_st_steps:
+                        # 使用 mIoU 作为主要指标 (AUPRO 可能为 NaN)
+                        current_metric = metrics.get("mIoU", 0.0)
+                        if current_metric > best_seg_metric:
+                            best_seg_metric = current_metric
+                            print(f"--- New Best Segmentation Model! mIoU: {best_seg_metric:.4f} ---")
+                            torch.save(model.state_dict(), best_seg_state_path)
+                            
+                except Exception as e:
+                    print(f"Evaluation failed: {e}")
+                
+                # 恢复训练模式
+                if global_step < args.de_st_steps:
+                    model.student_net.train()
+                    model.segmentation_net.eval()
+                else:
+                    model.student_net.eval()
+                    model.segmentation_net.train()
 
             # 定期在控制台打印训练信息
             if global_step % args.log_per_steps == 0:
@@ -228,11 +279,37 @@ def train(args):
                 break
 
     # --- 8. 保存模型 ---
-    # 训练结束后，将模型的最终状态（权重和参数）保存到文件中。
-    print(f"--- 训练完成，模型已保存至: {os.path.join(args.checkpoint_path, run_name + '.pckl')} ---")
-    torch.save(
-        model.state_dict(), os.path.join(args.checkpoint_path, run_name + ".pckl")
-    )
+    # 训练结束后，保存最终的模型。
+    # 优先保存训练过程中通过 evaluate 选出的最佳模型 (best_seg_state_path)。
+    # 如果没有生成最佳模型（例如未运行评估），则保存当前最后一步的模型。
+    
+    final_model_path = os.path.join(args.checkpoint_path, run_name + ".pckl")
+    
+    if os.path.exists(best_seg_state_path):
+        print(f"--- 训练完成，正在将最佳模型 (mIoU: {best_seg_metric:.4f}) 移动为最终结果 ---")
+        # 复制/移动为最终名称
+        shutil.copy(best_seg_state_path, final_model_path)
+        # 删除中间文件
+        os.remove(best_seg_state_path)
+    else:
+        print(f"--- 训练完成，未找到最佳模型记录，保存当前模型至: {final_model_path} ---")
+        torch.save(model.state_dict(), final_model_path)
+        
+    # 清理中间过程保存的 S-T 模型
+    if os.path.exists(best_st_state_path):
+        print(f"--- 清理中间 S-T 模型: {os.path.basename(best_st_state_path)} ---")
+        os.remove(best_st_state_path)
+
+    end_time = datetime.now()
+    duration = end_time - start_time
+    print(f"--- 训练结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+    print(f"--- 训练总时长: {duration} ---")
+
+    # --- 9. 自动绘制并保存 Loss/Metric 曲线 ---
+    print("--- 正在绘制并保存 Loss 和评估指标曲线 ---")
+    # 最终保存的目录是 args.vis_path/run_name
+    vis_save_dir = os.path.join(args.vis_path, run_name)
+    save_metric_plots(log_dir, vis_save_dir)
 
 
 if __name__ == "__main__":
@@ -246,11 +323,12 @@ if __name__ == "__main__":
 
     # -- 数据集路径参数 --
     # default路径使用了 'r' 前缀来表示原始字符串，避免反斜杠 `\` 被错误解析。
-    parser.add_argument("--rod_dir", type=str, default=r"D:\\Dataset\\ForMyThesis\\MiniTest\\train\\good\\images", help="完好图像（good）的目录路径")
-    parser.add_argument("--scratch_dir", type=str, default=r"D:\\Dataset\\ForMyThesis\\MiniTest\\train\\scratch", help="划痕缺陷（scratch）的目录路径")
-    parser.add_argument("--dent_dir", type=str, default=r"D:\\Dataset\\ForMyThesis\\MiniTest\\train\\dent", help="凹痕缺陷（dent）的目录路径")
+    parser.add_argument("--rod_dir", type=str, default=r"D:\Dataset\ForMyThesis\MiniTest\train\good\images", help="完好图像（good）的目录路径")
+    parser.add_argument("--scratch_dir", type=str, default=r"D:\Dataset\ForMyThesis\MiniTest\train\scratch", help="划痕缺陷（scratch）的目录路径")
+    parser.add_argument("--dent_dir", type=str, default=r"D:\Dataset\ForMyThesis\MiniTest\train\dent", help="凹痕缺陷（dent）的目录路径")
     parser.add_argument("--dotted_dir", type=str, default=None, help="点状缺陷（dotted）的目录路径 (可选)")
-
+    parser.add_argument("--test_dir", type=str, default=r"D:\Dataset\ForMyThesis\MiniTest\eval\images", help="测试集图像目录路径 (用于训练中评估)")
+    
     # -- 数据增强参数 --
     parser.add_argument('--rotate_90', action='store_true', help='启用90度旋转数据增强')
     parser.add_argument('--random_rotate', type=int, default=0, help='随机旋转增强的最大角度 (0表示不启用)')
@@ -259,6 +337,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_path", type=str, default="./saved_model/", help="保存模型检查点的路径")
     parser.add_argument("--run_name_head", type=str, default="DeSTSeg_ROD", help="运行名称的前缀")
     parser.add_argument("--log_path", type=str, default="./logs/", help="保存TensorBoard日志的路径")
+    parser.add_argument("--vis_path", type=str, default="./vis/", help="保存可视化图表的路径")
+    parser.add_argument("--num_classes", type=int, default=4, help="类别数量")
 
     # -- 训练超参数 --
     parser.add_argument("--bs", type=int, default=8, help="训练的批量大小 (Batch Size)")
@@ -267,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr_seghead", type=float, default=0.01, help="分割网络中分割头部分的学习率")
     parser.add_argument("--steps", type=int, default=5000, help="总训练步数")
     parser.add_argument("--de_st_steps", type=int, default=1000, help="第一阶段训练学生网络的步数")
-    parser.add_argument("--eval_per_steps", type=int, default=1000, help="每N步评估一次模型 (当前未使用)")
+    parser.add_argument("--eval_per_steps", type=int, default=1000, help="每N步评估一次模型")
     parser.add_argument("--log_per_steps", type=int, default=50, help="每N步在控制台记录一次训练信息")
     parser.add_argument("--gamma", type=float, default=2, help="Focal Loss中的gamma参数")
 
