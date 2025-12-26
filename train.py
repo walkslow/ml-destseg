@@ -4,6 +4,9 @@ import argparse
 import os
 import shutil
 import warnings
+# 忽略所有警告 (包括 torchmetrics 产生的 pkg_resources 弃用警告)
+warnings.filterwarnings("ignore")
+
 import copy
 from datetime import datetime
 
@@ -17,12 +20,10 @@ from torch.utils.data import DataLoader
 from constant import RESIZE_SHAPE, NORMALIZE_MEAN_L, NORMALIZE_STD_L, NORMALIZE_MEAN_RGB, NORMALIZE_STD_RGB
 from data.rod_dataset import RodDataset
 from eval import evaluate # 评估函数
+from model.model_utils import setup_seed, seed_worker
 from model.destseg import DeSTSeg
 from model.losses import cosine_similarity_loss, focal_loss, dice_loss
 from visualize import save_metric_plots
-
-# 忽略不必要的警告信息，保持输出整洁
-warnings.filterwarnings("ignore")
 
 
 def train(args):
@@ -34,6 +35,9 @@ def train(args):
     """
     start_time = datetime.now()
     print(f"--- 训练开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+
+    # 设置随机种子
+    setup_seed(args.seed)
 
     # --- 1. 初始化和环境设置 ---
     # 自动检测可用的CUDA设备，如果无可用GPU，则自动切换到CPU。这种设计增强了代码的设备兼容性。
@@ -117,12 +121,17 @@ def train(args):
     )
 
     # 实例化DataLoader，用于高效地批量加载数据
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.bs,          # 每个批次加载的样本数
         shuffle=True,               # 在每个epoch开始时打乱数据顺序，增加模型泛化能力
         num_workers=args.num_workers, # 使用多个子进程并行加载数据，加快数据准备速度
         drop_last=True,             # 如果最后一个批次的样本数不足batch_size，则丢弃该批次
+        worker_init_fn=seed_worker,
+        generator=g,
     )
 
     # --- 6. 训练主循环 ---
@@ -380,6 +389,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_per_steps", type=int, default=1000, help="每N步评估一次模型")
     parser.add_argument("--log_per_steps", type=int, default=50, help="每N步在控制台记录一次训练信息")
     parser.add_argument("--gamma", type=float, default=2, help="Focal Loss中的gamma参数")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子，用于复现实验结果")
 
     # 解析命令行传入的参数
     args = parser.parse_args()
