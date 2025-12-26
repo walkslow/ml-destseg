@@ -2,10 +2,43 @@ from typing import Callable, Optional
 # Callable:用于类型提示，表示一个可调用对象（函数、方法、lambda表达式等）。用法：Callable[[参数类型], 返回值类型]
 # Optional:用于类型提示，表示一个值可以是指定类型或 None。用法：Optional[类型]
 
+import random
+import numpy as np
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+
+def setup_seed(seed: int):
+    """
+    设置全局随机种子，确保实验可复现。
+    涵盖了 Python random, numpy, torch cpu/gpu, cudnn 等。
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    
+    # 确保卷积算法的选择是确定的
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # 设置环境变量，某些库可能会用到
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"--- Global random seed set to {seed} ---")
+
+
+def seed_worker(worker_id):
+    """
+    DataLoader的worker_init_fn，确保每个worker的随机种子是确定的。
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def conv3x3(
