@@ -2,6 +2,9 @@ import argparse
 import os
 import shutil
 import warnings
+# 忽略所有警告 (包括 torchmetrics 产生的 pkg_resources 弃用警告)
+warnings.filterwarnings("ignore")
+
 from datetime import datetime
 import torch
 import torch.nn.functional as F
@@ -20,13 +23,12 @@ from constant import (
 # Dataset & Model
 from data.rod_dataset import RodDataset
 from model.destseg import DeSTSeg
+from model.model_utils import setup_seed, seed_worker
 
 # Metrics
 from model.metrics import MulticlassSegmentationMetrics, MulticlassAUPRO
 from visualize import save_metric_plots
 from draw import save_visual_comparison
-
-warnings.filterwarnings("ignore")
 
 
 def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save_dir=None, vis_num_images=4):
@@ -65,8 +67,15 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
             normalize_mean_rgb=NORMALIZE_MEAN_RGB,
             normalize_std_rgb=NORMALIZE_STD_RGB,
         )
+        g = torch.Generator()
+        if hasattr(args, 'seed'):
+             g.manual_seed(args.seed)
+        else:
+             g.manual_seed(42) # fallback
+             
         dataloader = DataLoader(
-            dataset, batch_size=args.bs, shuffle=False, num_workers=args.num_workers
+            dataset, batch_size=args.bs, shuffle=False, num_workers=args.num_workers,
+            worker_init_fn=seed_worker, generator=g
         )
 
         for _, sample_batched in enumerate(dataloader):
@@ -177,6 +186,7 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
 
 
 def test(args):
+    setup_seed(args.seed)
     start_time = datetime.now()
     print(f"--- 测试开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
 
@@ -249,6 +259,7 @@ if __name__ == "__main__":
     # 模型参数
     parser.add_argument("--bs", type=int, default=16, help="Batch size")
     parser.add_argument("--num_classes", type=int, default=4, help="Number of classes (including background)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     args = parser.parse_args()
 
