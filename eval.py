@@ -230,11 +230,21 @@ def test(args):
     # 这里的 map_location 确保权重能加载到正确的设备上（即使用户在 CPU 机器上加载 GPU 训练的权重）
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     
-    evaluate(args, model, visualizer)
+    # --- Visualization Setup ---
+    vis_save_dir = os.path.join(args.vis_path, run_name, "gt_vs_pred")
+    if not os.path.exists(vis_save_dir):
+        os.makedirs(vis_save_dir)
+
+    # 传递 vis_gt_pred=True 以及相关参数，以便在测试时生成可视化图像
+    evaluate(args, model, visualizer, global_step=0, vis_gt_pred=args.vis_gt_pred, vis_save_dir=vis_save_dir, vis_num_images=args.vis_num_images)
+
+    # 确保所有数据写入磁盘
+    visualizer.flush()
+    visualizer.close()
 
     # --- 自动绘制并保存 Loss/Metric 曲线 ---
     print("--- 正在绘制并保存评估指标曲线 ---")
-    vis_save_dir = os.path.join(args.vis_path, run_name)
+    vis_save_dir = os.path.join(args.vis_path, run_name, "metrics")
     save_metric_plots(log_dir, vis_save_dir)
 
     end_time = datetime.now()
@@ -260,6 +270,8 @@ if __name__ == "__main__":
     parser.add_argument("--bs", type=int, default=16, help="Batch size")
     parser.add_argument("--num_classes", type=int, default=4, help="Number of classes (including background)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--vis_gt_pred", action="store_true", help="Visualize GT and prediction")
+    parser.add_argument("--vis_num_images", type=int, default=4, help="Number of images to visualize")
 
     args = parser.parse_args()
 
