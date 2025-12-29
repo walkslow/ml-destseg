@@ -238,7 +238,7 @@ def train(args):
             visualizer.add_scalar("Loss/Total_Loss", total_loss_val, global_step)
 
             # 定期评估模型性能
-            if global_step % args.eval_per_steps == 0 and args.test_dir:
+            if (global_step % args.eval_per_steps == 0 or global_step == args.steps) and args.test_dir:
                 print(f"--- Running evaluation at step {global_step} ---")
                 eval_args = copy.copy(args)
                 eval_args.rod_dir = args.test_dir
@@ -261,6 +261,7 @@ def train(args):
                          
                          if current_eval_idx in target_indices:
                              should_vis = True
+                    should_vis = should_vis or global_step == args.steps
                     
                     vis_save_dir = None
                     if should_vis:
@@ -307,7 +308,8 @@ def train(args):
                         f"训练步数 {global_step}/{args.steps} | "
                         f"阶段: 分割网络 | "
                         f"Focal损失: {round(float(focal_loss_val), 4)} | "
-                        f"Dice损失: {round(float(dice_loss_val), 4)}"
+                        f"Dice损失: {round(float(dice_loss_val), 4)} | "
+                        f"总损失: {round(float(total_loss_val), 4)}"
                     )
 
             # 检查是否达到总训练步数，如果是，则终止训练
