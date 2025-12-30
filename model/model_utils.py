@@ -313,3 +313,21 @@ class ASPP(nn.Module):
         res = torch.cat(res, dim=1)
         res = self.aspp_fusion_layer(res)
         return res
+
+
+def get_scheduler(optimizer, total_steps, warmup_ratio=0.1):
+    warmup_steps = int(total_steps * warmup_ratio)
+    # 1. Warmup: 学习率从0线性增加到初始值
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.001, end_factor=1.0, total_iters=warmup_steps
+    )
+    # 2. Cosine Decay: 学习率按余弦曲线衰减到0
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps - warmup_steps, eta_min=0.0
+    )
+    # 3. 串联: 先执行Warmup，再执行Cosine Decay
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[warmup_steps]
+    )
