@@ -31,7 +31,7 @@ from visualize import save_metric_plots
 from draw import save_visual_comparison
 
 
-def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save_dir=None, vis_num_images=4):
+def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save_dir=None, vis_num_images=4, calc_aupro=True, dataloader=None):
     model.eval()
     
     device = next(model.parameters()).device
@@ -46,10 +46,11 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
     
     # 初始化多分类 AUPRO 指标 (One-vs-Rest)
     # AUPRO 通常忽略背景类 (index 0)
-    aupro_metric = MulticlassAUPRO(
-        num_classes=args.num_classes, 
-        ignore_index=0
-    ).to(device)
+    if calc_aupro:
+        aupro_metric = MulticlassAUPRO(
+            num_classes=args.num_classes, 
+            ignore_index=0
+        ).to(device)
 
     # Visualization accumulation
     vis_imgs_accum = []
@@ -57,26 +58,29 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
     vis_pred_accum = []
 
     with torch.no_grad():
-        print(f"Loading test data from: {args.rod_dir}")
-        dataset = RodDataset(
-            is_train=False,
-            rod_dir=args.rod_dir,
-            resize_shape=RESIZE_SHAPE,
-            normalize_mean_l=NORMALIZE_MEAN_L,
-            normalize_std_l=NORMALIZE_STD_L,
-            normalize_mean_rgb=NORMALIZE_MEAN_RGB,
-            normalize_std_rgb=NORMALIZE_STD_RGB,
-        )
-        g = torch.Generator()
-        if hasattr(args, 'seed'):
-             g.manual_seed(args.seed)
+        if dataloader is None:
+            print(f"Loading test data from: {args.rod_dir}")
+            dataset = RodDataset(
+                is_train=False,
+                rod_dir=args.rod_dir,
+                resize_shape=RESIZE_SHAPE,
+                normalize_mean_l=NORMALIZE_MEAN_L,
+                normalize_std_l=NORMALIZE_STD_L,
+                normalize_mean_rgb=NORMALIZE_MEAN_RGB,
+                normalize_std_rgb=NORMALIZE_STD_RGB,
+            )
+            g = torch.Generator()
+            if hasattr(args, 'seed'):
+                 g.manual_seed(args.seed)
+            else:
+                 g.manual_seed(42) # fallback
+                 
+            dataloader = DataLoader(
+                dataset, batch_size=args.bs, shuffle=False, num_workers=args.num_workers,
+                worker_init_fn=seed_worker, generator=g
+            )
         else:
-             g.manual_seed(42) # fallback
-             
-        dataloader = DataLoader(
-            dataset, batch_size=args.bs, shuffle=False, num_workers=args.num_workers,
-            worker_init_fn=seed_worker, generator=g
-        )
+            print(f"Using pre-loaded dataloader with {len(dataloader.dataset)} samples")
 
         for _, sample_batched in enumerate(dataloader):
             # 获取输入数据 (移动到设备)
@@ -112,8 +116,9 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
             
             # 2. 异常检测指标 (AUPRO)
             # MulticlassAUPRO 需要概率图，所以先做 Softmax
-            probs = torch.softmax(output_segmentation, dim=1)
-            aupro_metric.update(probs, mask)
+            if calc_aupro:
+                probs = torch.softmax(output_segmentation, dim=1)
+                aupro_metric.update(probs, mask)
             
             # --- Advanced Visualization (Accumulation) ---
             if vis_gt_pred and len(vis_imgs_accum) < vis_num_images:
@@ -149,7 +154,11 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
 
         # --- 计算并打印结果 ---
         results = seg_metrics.compute()
-        aupro_score = aupro_metric.compute()
+        if calc_aupro:
+            aupro_score = aupro_metric.compute()
+            aupro_val = aupro_score.item()
+        else:
+            aupro_val = 0.0
         
         # 提取标量值
         mIoU = results["mIoU"].item()
@@ -161,27 +170,32 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
             visualizer.add_scalar("Eval/mIoU", mIoU, global_step)
             visualizer.add_scalar("Eval/mDice", mDice, global_step)
             visualizer.add_scalar("Eval/mFscore", mFscore, global_step)
-            visualizer.add_scalar("Eval/AUPRO", aupro_score.item(), global_step)
+            if calc_aupro:
+                visualizer.add_scalar("Eval/AUPRO", aupro_val, global_step)
 
         print(f"Eval at step {global_step}")
         print("================================")
         print(f"mIoU:    {mIoU:.4f}")
         print(f"mDice:   {mDice:.4f}")
         print(f"mFscore: {mFscore:.4f}")
-        print(f"AUPRO:   {aupro_score.item():.4f}")
+        if calc_aupro:
+            print(f"AUPRO:   {aupro_val:.4f}")
+        else:
+            print(f"AUPRO:   Skipped")
         print("--------------------------------")
         print("Per-class IoU:", results["per_class_IoU"].cpu().numpy())
         print("================================")
         
         # 清理状态
         seg_metrics.reset()
-        aupro_metric.reset()
+        if calc_aupro:
+            aupro_metric.reset()
 
         return {
             "mIoU": mIoU,
             "mDice": mDice,
             "mFscore": mFscore,
-            "AUPRO": aupro_score.item()
+            "AUPRO": aupro_val
         }
 
 
