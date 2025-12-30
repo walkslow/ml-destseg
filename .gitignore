@@ -136,5 +136,8 @@ logs
 offline_packages
 vis
 test_*.py
+terminal_output
+*.bat
+*.ps1
 
 .vscode
