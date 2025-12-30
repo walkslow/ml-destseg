@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 from constant import RESIZE_SHAPE, NORMALIZE_MEAN_L, NORMALIZE_STD_L, NORMALIZE_MEAN_RGB, NORMALIZE_STD_RGB
 from data.rod_dataset import RodDataset
 from eval import evaluate # 评估函数
-from model.model_utils import setup_seed, seed_worker
+from model.model_utils import setup_seed, seed_worker, get_scheduler
 from model.destseg import DeSTSeg
 from model.losses import cosine_similarity_loss, focal_loss, dice_loss
 from visualize import save_metric_plots
@@ -73,31 +73,41 @@ def train(args):
     # .to(device): 将模型的所有参数和缓冲区移动到先前选定的设备（GPU或CPU）。
     model = DeSTSeg(num_classes=args.num_classes, dest=True, ed=True).to(device)
 
-    # --- 4. 优化器设置 ---
-    # 采用两阶段训练策略，因此需要为学生网络和分割网络分别设置优化器。
-    # 为分割网络设置优化器，并采用分层学习率（differentiated learning rates）：
-    # ResNet主干部分使用较小的学习率(lr_res)，因为通常加载预训练权重，需要微调。
-    # 分割头部分使用较大的学习率(lr_seghead)，因为它是新初始化的，需要更快的学习。
+    # --- 4. 优化器与学习率调度设置 ---
+    # 采用两阶段训练策略，因此需要为学生网络和分割网络分别设置优化器和调度器。
+    
+    # 4.1 分割网络优化器
     seg_optimizer = torch.optim.SGD(
         [
             {"params": model.segmentation_net.res.parameters(), "lr": args.lr_res},
             {"params": model.segmentation_net.head.parameters(), "lr": args.lr_seghead},
         ],
-        lr=0.001,  # 此处的lr是默认值，实际会被上面参数组中的lr覆盖
+        lr=0.001,
         momentum=0.9,
         weight_decay=1e-4,
         nesterov=False,
     )
-    # 为学生网络设置独立的优化器。
+    
+    # 4.2 学生网络优化器
     de_st_optimizer = torch.optim.SGD(
         [
             {"params": model.student_net.parameters(), "lr": args.lr_de_st},
         ],
-        lr=0.4, # 默认学习率
+        lr=0.4,
         momentum=0.9,
         weight_decay=1e-4,
         nesterov=False,
     )
+
+    # 4.3 学习率调度器 (Linear Warmup + Cosine Annealing)
+    # 计算各阶段的步数
+    st_steps = args.de_st_steps
+    seg_steps = args.steps - args.de_st_steps
+    
+    # 创建调度器
+    de_st_scheduler = get_scheduler(de_st_optimizer, st_steps)
+    seg_scheduler = get_scheduler(seg_optimizer, seg_steps)
+
 
     # --- 5. 数据集和数据加载器 ---
     print("--- 初始化训练数据集 ---")
@@ -138,6 +148,31 @@ def train(args):
     global_step = 0  # 初始化全局步数计数器，用于精确控制训练总长度
     flag = True      # 训练循环的控制标志
 
+    # 预加载验证集 DataLoader (如果指定了 test_dir)
+    # 将其放在循环外，避免每次 evaluate 都重新扫描目录和创建 workers
+    val_dataloader = None
+    if args.test_dir:
+        print(f"--- 预加载验证数据集: {args.test_dir} ---")
+        val_dataset = RodDataset(
+            is_train=False,
+            rod_dir=args.test_dir,
+            resize_shape=RESIZE_SHAPE,
+            normalize_mean_l=NORMALIZE_MEAN_L,
+            normalize_std_l=NORMALIZE_STD_L,
+            normalize_mean_rgb=NORMALIZE_MEAN_RGB,
+            normalize_std_rgb=NORMALIZE_STD_RGB,
+        )
+        val_g = torch.Generator()
+        val_g.manual_seed(args.seed)
+        val_dataloader = DataLoader(
+            val_dataset, 
+            batch_size=args.bs, 
+            shuffle=False, 
+            num_workers=args.num_workers,
+            worker_init_fn=seed_worker, 
+            generator=val_g
+        )
+
     # 最佳模型跟踪
     best_st_loss = float('inf')
     best_seg_metric = float('-inf')
@@ -161,8 +196,11 @@ def train(args):
             mask = sample_batched["mask"].to(device)
 
             # --- 两阶段训练逻辑 ---
+            # 定义当前训练阶段
+            is_student_phase = global_step < args.de_st_steps
+
             # 阶段一：训练学生网络 (de_st_steps)
-            if global_step < args.de_st_steps:
+            if is_student_phase:
                 model.student_net.train()    # 仅学生网络处于训练模式
                 model.segmentation_net.eval() # 分割网络处于评估模式，其参数不更新
             # 阶段二：训练分割网络
@@ -182,41 +220,56 @@ def train(args):
                 img_aug_rgb=img_aug_rgb        # 增强后的RGB图，当前模型实现中未使用
             )
 
-            # --- 掩码(mask)尺寸对齐 ---
-            # 原始的mask尺寸可能与模型的输出尺寸不一致，需要通过插值进行对齐。
-            # F.interpolate 要求输入是4D或5D张量 (N, C, ...)，而mask是3D (N, H, W)。
-            # 1. mask.unsqueeze(1): 在通道维度上增加一个维度，变为 (N, 1, H, W)。
-            # 2. F.interpolate(...): 使用 'nearest' 最近邻插值，将其空间尺寸调整为与分割输出一致。
-            # 3. .squeeze(1): 计算损失时，目标mask应为 (N, H, W)，因此移除通道维度。
-            mask = F.interpolate(
-                mask.unsqueeze(1).float(),
-                size=output_segmentation.size()[2:],
-                mode="nearest",
-            ).squeeze(1).long() # 确保mask的数据类型为long，以匹配损失函数要求
-
-            # --- 损失计算 ---
-            # 根据当前所处的训练阶段，计算不同的损失。
-            # 阶段一：仅计算学生-教师网络的余弦相似度损失，目标是让学生网络模仿教师网络。
-            cosine_loss_val = cosine_similarity_loss(output_de_st_list)
-            # 阶段二：计算分割网络的损失，由Focal Loss和Dice Loss两部分组成。
-            focal_loss_val = focal_loss(output_segmentation, mask, gamma=args.gamma)
-            dice_loss_val = dice_loss(output_segmentation, mask)
-
-            # --- 反向传播与优化 ---
-            if global_step < args.de_st_steps:
+            # --- 损失计算、反向传播与日志记录 ---
+            if is_student_phase:
+                # --- 阶段一：学生网络训练 ---
+                # 仅计算学生-教师网络的余弦相似度损失
+                cosine_loss_val = cosine_similarity_loss(output_de_st_list)
                 total_loss_val = cosine_loss_val
-                total_loss_val.backward()  # 计算梯度
-                de_st_optimizer.step()     # 更新学生网络的权重
+                
+                total_loss_val.backward()
+                de_st_optimizer.step()
+                de_st_scheduler.step() # 更新学生网络学习率
                 
                 # 跟踪最佳 S-T 模型 (基于 Cosine Loss)
                 if cosine_loss_val < best_st_loss:
                     best_st_loss = cosine_loss_val
                     torch.save(model.state_dict(), best_st_state_path)
 
+                # 日志记录：仅记录 Cosine Loss 和 学习率
+                visualizer.add_scalar("Loss/Cosine_Loss", cosine_loss_val, global_step + 1)
+                visualizer.add_scalar("LR/Student_Net", de_st_optimizer.param_groups[0]["lr"], global_step + 1)
+
             else:
-                total_loss_val = focal_loss_val + dice_loss_val
-                total_loss_val.backward()  # 计算梯度
-                seg_optimizer.step()       # 更新分割网络的权重
+                # --- 阶段二：分割网络训练 ---
+                # 掩码(mask)尺寸对齐 (仅在分割阶段需要)
+                mask = F.interpolate(
+                    mask.unsqueeze(1).float(),
+                    size=output_segmentation.size()[2:],
+                    mode="nearest",
+                ).squeeze(1).long()
+
+                # 计算分割网络的损失
+                focal_loss_val = focal_loss(output_segmentation, mask, gamma=args.gamma)
+                dice_loss_val = dice_loss(output_segmentation, mask)
+                # 使用命令行参数控制损失权重
+                total_loss_val = args.lambda_focal * focal_loss_val + args.lambda_dice * dice_loss_val
+                
+                # 梯度累积：损失除以累积步数
+                (total_loss_val / args.grad_acc_steps).backward()
+
+                if (global_step + 1) % args.grad_acc_steps == 0:
+                    seg_optimizer.step()
+                    seg_optimizer.zero_grad()
+                    seg_scheduler.step() # 更新分割网络学习率
+
+                # 日志记录：仅记录分割相关损失 和 学习率
+                visualizer.add_scalar("Loss/Focal_Loss", focal_loss_val, global_step + 1)
+                visualizer.add_scalar("Loss/Dice_Loss", dice_loss_val, global_step + 1)
+                visualizer.add_scalar("Loss/Total_Loss", total_loss_val, global_step + 1)
+                # 分别记录 ResNet (Backbone) 和 Head 的学习率
+                visualizer.add_scalar("LR/Seg_ResNet", seg_optimizer.param_groups[0]["lr"], global_step + 1)
+                visualizer.add_scalar("LR/Seg_Head", seg_optimizer.param_groups[1]["lr"], global_step + 1)
 
             global_step += 1 # 更新全局步数
 
@@ -229,24 +282,49 @@ def train(args):
                     # 重新将模型放到设备上 (以防万一)
                     model.to(device)
 
-            # --- 7. 日志记录和可视化 ---
-            # 使用visualizer将各项损失值写入TensorBoard，方便后续分析和可视化。
-            # global_step作为x轴，损失值作为y轴。
-            visualizer.add_scalar("Loss/Cosine_Loss", cosine_loss_val, global_step)
-            visualizer.add_scalar("Loss/Focal_Loss", focal_loss_val, global_step)
-            visualizer.add_scalar("Loss/Dice_Loss", dice_loss_val, global_step)
-            visualizer.add_scalar("Loss/Total_Loss", total_loss_val, global_step)
+            # --- 7. (移除) 原位置的日志记录已移动到上方条件块中 ---
+
 
             # 定期评估模型性能
-            if (global_step % args.eval_per_steps == 0 or global_step == args.steps) and args.test_dir:
+            # 修改评估策略：仅在分割训练阶段进行定期评估，并在阶段开始和结束时强制评估
+            should_run_eval = False
+            if args.test_dir:
+                # 1. 分割阶段开始前 (Phase 1 刚结束)
+                if global_step == args.de_st_steps:
+                    should_run_eval = True
+                
+                # 2. 分割阶段中的周期性评估 或 训练结束时
+                elif global_step > args.de_st_steps:
+                    steps_in_phase2 = global_step - args.de_st_steps
+                    if steps_in_phase2 % args.eval_per_steps == 0 or global_step == args.steps:
+                        should_run_eval = True
+
+            if should_run_eval:
                 print(f"--- Running evaluation at step {global_step} ---")
                 eval_args = copy.copy(args)
                 eval_args.rod_dir = args.test_dir
                 try:
-                    # Calculate total number of evaluations
-                    total_evals = args.steps // args.eval_per_steps
-                    current_eval_idx = global_step // args.eval_per_steps
-                    
+                    # 估算分割阶段的总评估次数
+                    seg_phase_steps = args.steps - args.de_st_steps
+                    # +1 是为了包含 baseline (step == de_st_steps) 那一次
+                    total_evals = seg_phase_steps // args.eval_per_steps + 1
+                    # 如果最后一步不能被整除，则最后一步会额外执行一次评估，总数+1
+                    if seg_phase_steps % args.eval_per_steps != 0:
+                        total_evals += 1
+
+                    # 计算当前是分割阶段的第几次评估
+                    # Phase 1 结束时 (Phase 2 开始前) 为第 1 次
+                    if global_step == args.de_st_steps:
+                        current_eval_idx = 1
+                    elif global_step == args.steps:
+                        # 如果是最后一步，直接设为最大索引
+                        current_eval_idx = total_evals
+                    else:
+                        # 普通周期性评估
+                        # 举例: de_st=500, eval=100. step=600 -> (100)//100 + 1 = 2.
+                        current_eval_idx = (global_step - args.de_st_steps) // args.eval_per_steps + 1
+
+
                     # Determine if we should visualize this step
                     should_vis = False
                     if args.vis_steps:
@@ -269,14 +347,21 @@ def train(args):
                         if not os.path.exists(vis_save_dir):
                             os.makedirs(vis_save_dir)
 
+                    # Determine if we should calc aupro
+                    # Calculate AUPRO if user requested it OR if it's the final step
+                    should_calc_aupro = args.val_calc_aupro or (global_step == args.steps)
+
                     # evaluate 现在返回指标字典
                     metrics = evaluate(eval_args, model, visualizer, global_step,
                                        vis_gt_pred=should_vis,
                                        vis_save_dir=vis_save_dir,
-                                       vis_num_images=args.vis_num_images)
+                                       vis_num_images=args.vis_num_images,
+                                       calc_aupro=should_calc_aupro,
+                                       dataloader=val_dataloader)
                     
                     # 仅在第二阶段 (分割训练) 跟踪最佳分割模型
-                    if global_step > args.de_st_steps:
+                    # 注意：global_step == args.de_st_steps 时也是评估分割模型(尽管还没开始训练分割头，作为baseline)
+                    if global_step >= args.de_st_steps:
                         # 使用 mIoU 作为主要指标 (AUPRO 可能为 NaN)
                         current_metric = metrics.get("mIoU", 0.0)
                         if current_metric > best_seg_metric:
@@ -297,7 +382,7 @@ def train(args):
 
             # 定期在控制台打印训练信息
             if global_step % args.log_per_steps == 0:
-                if global_step < args.de_st_steps:
+                if is_student_phase:
                     print(
                         f"训练步数 {global_step}/{args.steps} | "
                         f"阶段: 学生网络 | "
@@ -344,6 +429,10 @@ def train(args):
     print(f"--- 训练结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
     print(f"--- 训练总时长: {duration} ---")
 
+    # 确保所有TensorBoard数据写入磁盘
+    visualizer.flush()
+    visualizer.close()
+
     # --- 9. 自动绘制并保存 Loss/Metric 曲线 ---
     print("--- 正在绘制并保存 Loss 和评估指标曲线 ---")
     # 最终保存的目录是 args.vis_path/run_name/metrics
@@ -377,21 +466,25 @@ if __name__ == "__main__":
     parser.add_argument("--run_name_head", type=str, default="DeSTSeg_ROD", help="运行名称的前缀")
     parser.add_argument("--log_path", type=str, default="./logs/", help="保存TensorBoard日志的路径")
     parser.add_argument("--vis_path", type=str, default="./vis/", help="保存可视化图表的路径")
-    parser.add_argument("--vis_steps", type=int, nargs='+', default=[1, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
-    parser.add_argument("--vis_num_images", type=int, default=4, help="每次详细可视化时保存的图像数量")
-    parser.add_argument("--num_classes", type=int, default=4, help="类别数量")
+    parser.add_argument("--vis_steps", type=int, nargs='+', default=[1, 10, 20, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
+    parser.add_argument("--vis_num_images", type=int, default=16, help="每次详细可视化时保存的图像数量")
+    parser.add_argument("--val_calc_aupro", action="store_true", help="是否在验证期间计算 AUPRO 指标 (耗时较长，默认关闭，仅在最后一步计算)")
+    parser.add_argument("--num_classes", type=int, default=3, help="类别数量")
 
     # -- 训练超参数 --
     parser.add_argument("--bs", type=int, default=8, help="训练的批量大小 (Batch Size)")
-    parser.add_argument("--lr_de_st", type=float, default=0.4, help="学生网络的学习率")
-    parser.add_argument("--lr_res", type=float, default=0.1, help="分割网络中ResNet部分的学习率")
-    parser.add_argument("--lr_seghead", type=float, default=0.01, help="分割网络中分割头部分的学习率")
-    parser.add_argument("--steps", type=int, default=5000, help="总训练步数")
-    parser.add_argument("--de_st_steps", type=int, default=1000, help="第一阶段训练学生网络的步数")
-    parser.add_argument("--eval_per_steps", type=int, default=1000, help="每N步评估一次模型")
+    parser.add_argument("--lr_de_st", type=float, default=0.05, help="学生网络的学习率")
+    parser.add_argument("--lr_res", type=float, default=0.0001, help="分割网络中ResNet部分的学习率")
+    parser.add_argument("--lr_seghead", type=float, default=0.001, help="分割网络中分割头部分的学习率")
+    parser.add_argument("--steps", type=int, default=8000, help="总训练步数")
+    parser.add_argument("--de_st_steps", type=int, default=2000, help="第一阶段训练学生网络的步数")
+    parser.add_argument("--eval_per_steps", type=int, default=500, help="每N步评估一次模型")
     parser.add_argument("--log_per_steps", type=int, default=50, help="每N步在控制台记录一次训练信息")
     parser.add_argument("--gamma", type=float, default=2, help="Focal Loss中的gamma参数")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，用于复现实验结果")
+    parser.add_argument("--grad_acc_steps", type=int, default=4, help="梯度累积步数，用于模拟更大的Batch Size。实际BS = bs * grad_acc_steps")
+    parser.add_argument("--lambda_focal", type=float, default=20.0, help="Focal Loss 的权重系数")
+    parser.add_argument("--lambda_dice", type=float, default=1.0, help="Dice Loss 的权重系数")
 
     # 解析命令行传入的参数
     args = parser.parse_args()
