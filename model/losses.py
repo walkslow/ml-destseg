@@ -52,12 +52,12 @@ def focal_loss(inputs, targets, gamma=2, reduction='mean'):
         return loss
 
 
-def dice_loss(inputs, targets, smooth=1e-5):
+def dice_loss(inputs, targets, smooth=1.0):
     '''
     计算多分类Dice Loss。Dice Loss衡量的是预测与真实标签之间的重叠度，对类别不平衡问题鲁棒。
     :param inputs: 模型输出的原始logits, shape为(N, C, H, W)
     :param targets: 真实标签(类别索引), shape为(N, H, W)
-    :param smooth: 平滑因子，防止计算过程中除以零，默认1e-5
+    :param smooth: 平滑因子，防止计算过程中除以零，并平滑小目标/空目标的损失波动。默认1.0。
     :return: Dice Loss
     '''
     # 1. 将模型的logits输出通过softmax转换为概率分布
