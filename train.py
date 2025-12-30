@@ -40,11 +40,77 @@ def train(args):
     setup_seed(args.seed)
 
     # --- 1. 初始化和环境设置 ---
-    # 自动检测可用的CUDA设备，如果无可用GPU，则自动切换到CPU。这种设计增强了代码的设备兼容性。
-    # 使用f-string动态构建设备字符串，例如 "cuda:0"
-    device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
-    print(f"--- 使用设备: {device} ---")
+    # 处理 GPU 选择
+    if args.gpu_id is None:
+        args.gpu_id = [-1]
+    
+    # 检查是否请求使用 CPU
+    use_cpu_only = False
+    if len(args.gpu_id) == 1 and args.gpu_id[0] == -1:
+        use_cpu_only = True
+        print("--- 检测到 gpu_id=-1，将强制使用 CPU 模式 ---")
+        num_physical_gpus = 0 # 模拟无 GPU 环境
+    else:
+        # 尝试检测物理 GPU 数量 (不依赖 torch.cuda，避免提前初始化)
+        import subprocess
+        try:
+            # 使用 nvidia-smi 列出所有 GPU，统计行数
+            result = subprocess.check_output("nvidia-smi -L", shell=True)
+            # 针对 Windows/Linux 换行符差异进行处理，过滤空行
+            physical_gpus = [line for line in result.decode('utf-8').strip().split('\n') if line.strip()]
+            num_physical_gpus = len(physical_gpus)
+            print(f"--- 检测到物理 GPU 数量: {num_physical_gpus} ---")
+        except Exception as e:
+            # 如果 nvidia-smi 执行失败（如无驱动或未在 PATH 中），则无法验证
+            print(f"--- 警告: 无法检测物理 GPU 数量 (nvidia-smi error: {e})，将尝试直接使用 CPU ---")
+            num_physical_gpus = 0
+            use_cpu_only = True
 
+    # 验证并过滤 GPU ID
+    valid_gpu_ids = []
+    if use_cpu_only:
+        valid_gpu_ids = []
+    elif num_physical_gpus > 0:
+         for gpu_idx in args.gpu_id:
+             if 0 <= gpu_idx < num_physical_gpus:
+                 valid_gpu_ids.append(gpu_idx)
+             else:
+                 print(f"--- 警告: GPU ID {gpu_idx} 超出范围 (0-{num_physical_gpus-1})，将被忽略 ---")
+    
+    # 设置 CUDA_VISIBLE_DEVICES
+    if valid_gpu_ids:
+        # 将 int 列表转换为字符串列表用于 join
+        gpu_list_str = [str(x) for x in valid_gpu_ids]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_list_str)
+        print(f"--- 实际使用的 GPU ID: {valid_gpu_ids} ---")
+    else:
+        # 如果没有有效的 GPU ID，确保 CUDA_VISIBLE_DEVICES 为空，强制 PyTorch 使用 CPU（或看不到 GPU）
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        if not use_cpu_only: # 避免重复打印
+            print("--- 未指定有效的 GPU，将使用 CPU 训练 ---")
+
+    # 自动检测可用的CUDA设备 (此时受 CUDA_VISIBLE_DEVICES 影响)
+    if torch.cuda.is_available() and valid_gpu_ids:
+        # 重要：设置 CUDA_VISIBLE_DEVICES 后，逻辑设备 ID 总是从 0 开始
+        # 所以这里我们始终使用 cuda:0 作为主设备
+        device = torch.device("cuda:0")
+        
+        # 判断是否启用多卡模式
+        # PyTorch 看到的设备数量就是 len(valid_gpu_ids)
+        visible_devices = torch.cuda.device_count()
+        if visible_devices > 1:
+            args.use_multi_gpu = True
+            print(f"--- PyTorch 检测到 {visible_devices} 张可见 GPU，启用 DataParallel 模式 ---")
+        else:
+            args.use_multi_gpu = False
+            print("--- PyTorch 检测到单张可见 GPU，启用单卡模式 ---")
+    else:
+        device = torch.device("cpu")
+        args.use_multi_gpu = False
+        print("--- 使用 CPU 模式 ---")
+
+    print(f"--- 使用主设备: {device} ---")
+    
     # 确保用于保存模型权重（checkpoint）和训练日志（log）的目录存在，如果不存在则创建。
     if not os.path.exists(args.checkpoint_path):
         os.makedirs(args.checkpoint_path)
@@ -73,14 +139,24 @@ def train(args):
     # .to(device): 将模型的所有参数和缓冲区移动到先前选定的设备（GPU或CPU）。
     model = DeSTSeg(num_classes=args.num_classes, dest=True, ed=True).to(device)
 
+    # --- 多卡训练支持 (DataParallel) ---
+    if torch.cuda.device_count() > 1 and args.use_multi_gpu:
+        print(f"--- 检测到 {torch.cuda.device_count()} 张 GPU，启用 DataParallel 模式 ---")
+        model = torch.nn.DataParallel(model)
+        # 获取原始模型对象，以便访问其子模块 (segmentation_net, student_net)
+        # 在 DataParallel 模式下，model.module 才是真正的模型
+        real_model = model.module
+    else:
+        real_model = model
+
     # --- 4. 优化器与学习率调度设置 ---
     # 采用两阶段训练策略，因此需要为学生网络和分割网络分别设置优化器和调度器。
     
     # 4.1 分割网络优化器
     seg_optimizer = torch.optim.SGD(
         [
-            {"params": model.segmentation_net.res.parameters(), "lr": args.lr_res},
-            {"params": model.segmentation_net.head.parameters(), "lr": args.lr_seghead},
+            {"params": real_model.segmentation_net.res.parameters(), "lr": args.lr_res},
+            {"params": real_model.segmentation_net.head.parameters(), "lr": args.lr_seghead},
         ],
         lr=0.001,
         momentum=0.9,
@@ -91,7 +167,7 @@ def train(args):
     # 4.2 学生网络优化器
     de_st_optimizer = torch.optim.SGD(
         [
-            {"params": model.student_net.parameters(), "lr": args.lr_de_st},
+            {"params": real_model.student_net.parameters(), "lr": args.lr_de_st},
         ],
         lr=0.4,
         momentum=0.9,
@@ -201,12 +277,12 @@ def train(args):
 
             # 阶段一：训练学生网络 (de_st_steps)
             if is_student_phase:
-                model.student_net.train()    # 仅学生网络处于训练模式
-                model.segmentation_net.eval() # 分割网络处于评估模式，其参数不更新
+                real_model.student_net.train()    # 仅学生网络处于训练模式
+                real_model.segmentation_net.eval() # 分割网络处于评估模式，其参数不更新
             # 阶段二：训练分割网络
             else:
-                model.student_net.eval()     # 学生网络处于评估模式，冻结其参数
-                model.segmentation_net.train() # 仅分割网络处于训练模式
+                real_model.student_net.eval()     # 学生网络处于评估模式，冻结其参数
+                real_model.segmentation_net.train() # 仅分割网络处于训练模式
 
             # --- 前向传播 ---
             # 将数据输入模型，获取三个关键输出
@@ -234,7 +310,7 @@ def train(args):
                 # 跟踪最佳 S-T 模型 (基于 Cosine Loss)
                 if cosine_loss_val < best_st_loss:
                     best_st_loss = cosine_loss_val
-                    torch.save(model.state_dict(), best_st_state_path)
+                    torch.save(real_model.state_dict(), best_st_state_path)
 
                 # 日志记录：仅记录 Cosine Loss 和 学习率
                 visualizer.add_scalar("Loss/Cosine_Loss", cosine_loss_val, global_step + 1)
@@ -278,9 +354,11 @@ def train(args):
                 if os.path.exists(best_st_state_path):
                     print(f"--- [Phase Switch] Loading best S-T model (Loss: {best_st_loss:.6f}) for Segmentation training ---")
                     # 加载参数
-                    model.load_state_dict(torch.load(best_st_state_path))
+                    # 注意：加载参数时需要加载到 real_model (即 model.module)，而不是 DataParallel 包装后的 model
+                    # 因为 state_dict 是从 real_model 保存的
+                    real_model.load_state_dict(torch.load(best_st_state_path))
                     # 重新将模型放到设备上 (以防万一)
-                    model.to(device)
+                    real_model.to(device)
 
             # --- 7. (移除) 原位置的日志记录已移动到上方条件块中 ---
 
@@ -367,18 +445,25 @@ def train(args):
                         if current_metric > best_seg_metric:
                             best_seg_metric = current_metric
                             print(f"--- New Best Segmentation Model! mIoU: {best_seg_metric:.4f} ---")
-                            torch.save(model.state_dict(), best_seg_state_path)
+                            # 保存模型权重
+                            # 注意：如果 model 是 DataParallel，需要保存 model.module.state_dict()
+                            # 我们统一使用 real_model.state_dict()
+                            torch.save(real_model.state_dict(), best_seg_state_path)
                             
                 except Exception as e:
                     print(f"Evaluation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
                 # 恢复训练模式
+                # 注意：如果 model 是 DataParallel，需要访问 model.module 来设置子模块的模式
+                # 或者直接使用 real_model (它已经指向了 model.module 或 model)
                 if global_step < args.de_st_steps:
-                    model.student_net.train()
-                    model.segmentation_net.eval()
+                    real_model.student_net.train()
+                    real_model.segmentation_net.eval()
                 else:
-                    model.student_net.eval()
-                    model.segmentation_net.train()
+                    real_model.student_net.eval()
+                    real_model.segmentation_net.train()
 
             # 定期在控制台打印训练信息
             if global_step % args.log_per_steps == 0:
@@ -417,7 +502,8 @@ def train(args):
         os.remove(best_seg_state_path)
     else:
         print(f"--- 训练完成，未找到最佳模型记录，保存当前模型至: {final_model_path} ---")
-        torch.save(model.state_dict(), final_model_path)
+        # 保存模型权重 (使用 real_model 确保兼容性)
+        torch.save(real_model.state_dict(), final_model_path)
         
     # 清理中间过程保存的 S-T 模型
     if os.path.exists(best_st_state_path):
@@ -446,16 +532,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='使用DeSTSeg在ROD数据集上进行多分类分割')
 
     # -- 硬件与并行化参数 --
-    parser.add_argument("--gpu_id", type=int, default=0, help="指定使用的GPU编号")
+    parser.add_argument("--gpu_id", type=int, nargs='+', default=[0, 1], help="指定使用的GPU编号。单卡如 '0'，多卡如 '0 1'，使用CPU如 '-1'")
     parser.add_argument("--num_workers", type=int, default=16, help="数据加载器使用的工作进程数")
 
     # -- 数据集路径参数 --
     # default路径使用了 'r' 前缀来表示原始字符串，避免反斜杠 `\` 被错误解析。
-    parser.add_argument("--rod_dir", type=str, default=r"D:\Dataset\ForMyThesis\MiniTest\train\good\images", help="完好图像（good）的目录路径")
-    parser.add_argument("--scratch_dir", type=str, default=r"D:\Dataset\ForMyThesis\MiniTest\train\scratch", help="划痕缺陷（scratch）的目录路径")
-    parser.add_argument("--dent_dir", type=str, default=r"D:\Dataset\ForMyThesis\MiniTest\train\dent", help="凹痕缺陷（dent）的目录路径")
+    parser.add_argument("--rod_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\good_7500\images", help="完好图像（good）的目录路径")
+    parser.add_argument("--scratch_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\scratch_200", help="划痕缺陷（scratch）的目录路径")
+    parser.add_argument("--dent_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\dent_300", help="凹痕缺陷（dent）的目录路径")
     parser.add_argument("--dotted_dir", type=str, default=None, help="点状缺陷（dotted）的目录路径 (可选)")
-    parser.add_argument("--test_dir", type=str, default=r"D:\Dataset\ForMyThesis\MiniTest\eval\images", help="测试集图像目录路径 (用于训练中评估)")
+    parser.add_argument("--test_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\images", help="测试集图像目录路径 (用于训练中评估)")
     
     # -- 数据增强参数 --
     parser.add_argument('--rotate_90', action='store_true', help='启用90度旋转数据增强')
@@ -466,23 +552,23 @@ if __name__ == "__main__":
     parser.add_argument("--run_name_head", type=str, default="DeSTSeg_ROD", help="运行名称的前缀")
     parser.add_argument("--log_path", type=str, default="./logs/", help="保存TensorBoard日志的路径")
     parser.add_argument("--vis_path", type=str, default="./vis/", help="保存可视化图表的路径")
-    parser.add_argument("--vis_steps", type=int, nargs='+', default=[1, 10, 20, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
+    parser.add_argument("--vis_steps", type=int, nargs='+', default=[10, 20, 30, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
     parser.add_argument("--vis_num_images", type=int, default=16, help="每次详细可视化时保存的图像数量")
     parser.add_argument("--val_calc_aupro", action="store_true", help="是否在验证期间计算 AUPRO 指标 (耗时较长，默认关闭，仅在最后一步计算)")
     parser.add_argument("--num_classes", type=int, default=3, help="类别数量")
 
     # -- 训练超参数 --
-    parser.add_argument("--bs", type=int, default=8, help="训练的批量大小 (Batch Size)")
+    parser.add_argument("--bs", type=int, default=32, help="训练的批量大小 (Batch Size)")
     parser.add_argument("--lr_de_st", type=float, default=0.05, help="学生网络的学习率")
     parser.add_argument("--lr_res", type=float, default=0.0001, help="分割网络中ResNet部分的学习率")
     parser.add_argument("--lr_seghead", type=float, default=0.001, help="分割网络中分割头部分的学习率")
-    parser.add_argument("--steps", type=int, default=8000, help="总训练步数")
-    parser.add_argument("--de_st_steps", type=int, default=2000, help="第一阶段训练学生网络的步数")
-    parser.add_argument("--eval_per_steps", type=int, default=500, help="每N步评估一次模型")
+    parser.add_argument("--steps", type=int, default=10000, help="总训练步数")
+    parser.add_argument("--de_st_steps", type=int, default=2500, help="第一阶段训练学生网络的步数")
+    parser.add_argument("--eval_per_steps", type=int, default=200, help="在训练分割网络的过程中每N步评估一次模型")
     parser.add_argument("--log_per_steps", type=int, default=50, help="每N步在控制台记录一次训练信息")
     parser.add_argument("--gamma", type=float, default=2, help="Focal Loss中的gamma参数")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，用于复现实验结果")
-    parser.add_argument("--grad_acc_steps", type=int, default=4, help="梯度累积步数，用于模拟更大的Batch Size。实际BS = bs * grad_acc_steps")
+    parser.add_argument("--grad_acc_steps", type=int, default=1, help="梯度累积步数，用于模拟更大的Batch Size。实际BS = bs * grad_acc_steps")
     parser.add_argument("--lambda_focal", type=float, default=20.0, help="Focal Loss 的权重系数")
     parser.add_argument("--lambda_dice", type=float, default=1.0, help="Dice Loss 的权重系数")
 
