@@ -68,6 +68,86 @@ def save_metric_plots(log_dir, save_dir):
         plt.close()
         print(f"Saved: {file_path}")
 
+    # --- 生成 2x2 组合 Loss 图 ---
+    loss_tags = [
+        "Loss/Cosine_Loss", 
+        "Loss/Dice_Loss", 
+        "Loss/Focal_Loss", 
+        "Loss/Total_Loss"
+    ]
+
+    # 检查是否至少存在一个相关的 loss 数据
+    if any(tag in data for tag in loss_tags):
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        axes = axes.flatten()
+        
+        for i, tag in enumerate(loss_tags):
+            ax = axes[i]
+            if tag in data:
+                steps, values = data[tag]
+                ax.plot(steps, values, linewidth=2)
+                ax.set_title(tag, fontsize=14)
+                ax.set_xlabel("Global Step")
+                ax.set_ylabel("Value")
+                ax.grid(True, linestyle="--", alpha=0.7)
+            else:
+                # 如果某个 Loss 不存在 (例如只训练了其中一个阶段)，则显示提示
+                ax.text(0.5, 0.5, f"{tag}\nNot Available", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=ax.transAxes, fontsize=12, color='gray')
+                ax.set_title(tag, fontsize=14)
+        
+        plt.tight_layout()
+        combined_path = os.path.join(save_dir, "Combined_Losses.png")
+        plt.savefig(combined_path, dpi=300)
+        plt.close()
+        print(f"Saved combined plot: {combined_path}")
+
+    # --- 生成 2x2 组合 Eval Metrics 图 ---
+    eval_tags = [
+        "Eval/mIoU", 
+        "Eval/mDice", 
+        "Eval/mFscore", 
+        "Eval/AUPRO"
+    ]
+
+    # 检查是否至少存在一个相关的 eval 数据
+    if any(tag in data for tag in eval_tags):
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        axes = axes.flatten()
+        
+        for i, tag in enumerate(eval_tags):
+            ax = axes[i]
+            if tag in data:
+                steps, values = data[tag]
+                ax.plot(steps, values, linewidth=2, color='orange') # 使用不同颜色区分 Eval
+                ax.set_title(tag, fontsize=14)
+                ax.set_xlabel("Global Step")
+                ax.set_ylabel("Value")
+                ax.grid(True, linestyle="--", alpha=0.7)
+                
+                # 在图中标注最大值点
+                if len(values) > 0:
+                    max_val = max(values)
+                    max_idx = values.index(max_val)
+                    max_step = steps[max_idx]
+                    ax.annotate(f'Max: {max_val:.4f}', 
+                                xy=(max_step, max_val), 
+                                xytext=(10, -20), 
+                                textcoords='offset points',
+                                arrowprops=dict(arrowstyle="->", connectionstyle="arc3,rad=.2"))
+            else:
+                ax.text(0.5, 0.5, f"{tag}\nNot Available", 
+                        horizontalalignment='center', verticalalignment='center',
+                        transform=ax.transAxes, fontsize=12, color='gray')
+                ax.set_title(tag, fontsize=14)
+        
+        plt.tight_layout()
+        combined_eval_path = os.path.join(save_dir, "Combined_Eval_Metrics.png")
+        plt.savefig(combined_eval_path, dpi=300)
+        plt.close()
+        print(f"Saved combined plot: {combined_eval_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="从 TensorBoard 日志绘制并保存所有指标曲线")
