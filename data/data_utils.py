@@ -185,8 +185,7 @@ def cut_paste(normal_image, scratch_image, scratch_mask, dent_image, dent_mask, 
             min_crop_ratio = min_defect_area / rect_area
             
             # 确保裁剪比例在合理范围内
-            min_crop_ratio = max(min_crop_ratio, 0.3)  # 最小不低于0.3
-            min_crop_ratio = min(min_crop_ratio, 0.9)  # 最大不超过0.9
+            min_crop_ratio = max(min_crop_ratio, 0.9)  # 最小不低于0.9
             
             if rect_h > rect_w:  # 如果高是长边
                 sub_h = int(rect_h * random.uniform(min_crop_ratio, 1.0))
