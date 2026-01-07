@@ -4,6 +4,7 @@ import argparse
 import os
 import shutil
 import warnings
+import sys
 # 忽略所有警告 (包括 torchmetrics 产生的 pkg_resources 弃用警告)
 warnings.filterwarnings("ignore")
 
@@ -20,7 +21,7 @@ from torch.utils.data import DataLoader
 from constant import RESIZE_SHAPE, NORMALIZE_MEAN_L, NORMALIZE_STD_L, NORMALIZE_MEAN_RGB, NORMALIZE_STD_RGB
 from data.rod_dataset import RodDataset
 from eval import evaluate # 评估函数
-from model.model_utils import setup_seed, seed_worker, get_scheduler
+from model.model_utils import setup_seed, seed_worker, get_scheduler, DualLogger
 from model.destseg import DeSTSeg
 from model.losses import cosine_similarity_loss, focal_loss, dice_loss
 from visualize import save_metric_plots
@@ -33,13 +34,31 @@ def train(args):
     到执行核心训练循环、计算损失、反向传播和模型保存的全过程。
     :param args: 命令行传入的参数对象
     """
+    # --- 1. 运行命名和日志设置 ---
+    # 为了方便实验跟踪和比较，为每次运行生成一个唯一的名称。
+    # 名称由一个固定的前缀(run_name_head)、总训练步数(steps)和当前的日期时间戳构成。
+    current_time = datetime.now().strftime("%Y%m%d%H%M")
+    run_name = f"{args.run_name_head}_{args.steps}_{current_time}"
+    
+    # --- 配置 DualLogger ---
+    # 将终端输出同时写入文件
+    if not os.path.exists(args.terminal_output_dir):
+        os.makedirs(args.terminal_output_dir)
+    terminal_log_path = os.path.join(args.terminal_output_dir, run_name + ".txt")
+    
+    # 保存原始 stdout 以便后续恢复（虽然这里可能不需要恢复，但这是一个好习惯）
+    original_stdout = sys.stdout
+    sys.stdout = DualLogger(terminal_log_path)
+    
+    print(f"--- 终端输出将同时保存至: {terminal_log_path} ---")
+
     start_time = datetime.now()
     print(f"--- 训练开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
 
     # 设置随机种子
     setup_seed(args.seed)
 
-    # --- 1. 初始化和环境设置 ---
+    # --- 2. 初始化和环境设置 ---
     # 处理 GPU 选择
     if args.gpu_id is None:
         args.gpu_id = [-1]
@@ -112,17 +131,12 @@ def train(args):
     print(f"--- 使用主设备: {device} ---")
     
     # 确保用于保存模型权重（checkpoint）和训练日志（log）的目录存在，如果不存在则创建。
-    if not os.path.exists(args.checkpoint_path):
-        os.makedirs(args.checkpoint_path)
-    if not os.path.exists(args.log_path):
-        os.makedirs(args.log_path)
+    if not os.path.exists(args.checkpoint_dir):
+        os.makedirs(args.checkpoint_dir)
+    if not os.path.exists(args.log_dir):
+        os.makedirs(args.log_dir)
 
-    # --- 2. 运行命名和日志设置 ---
-    # 为了方便实验跟踪和比较，为每次运行生成一个唯一的名称。
-    # 名称由一个固定的前缀(run_name_head)、总训练步数(steps)和当前的日期时间戳构成。
-    current_time = datetime.now().strftime("%Y%m%d%H%M")
-    run_name = f"{args.run_name_head}_{args.steps}_{current_time}"
-    log_dir = os.path.join(args.log_path, run_name + "/")
+    log_dir = os.path.join(args.log_dir, run_name + "/")
     # 如果该日志目录已存在（例如，短时间内重复运行），则先删除，以确保一个干净的日志环境。
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
@@ -258,8 +272,8 @@ def train(args):
     # 最佳模型跟踪
     best_st_loss = float('inf')
     best_seg_metric = float('-inf')
-    best_st_state_path = os.path.join(args.checkpoint_path, f"{run_name}_best_st.pckl")
-    best_seg_state_path = os.path.join(args.checkpoint_path, f"{run_name}_best_seg.pckl")
+    best_st_state_path = os.path.join(args.checkpoint_dir, f"{run_name}_best_st.pckl")
+    best_seg_state_path = os.path.join(args.checkpoint_dir, f"{run_name}_best_seg.pckl")
 
     # 使用 "while" 循环和 "global_step" 实现基于步数（step-based）的训练，
     # 而非传统的基于轮次（epoch-based）的训练。这在需要精确控制迭代次数的场景中非常有用，适用于对比学习/自监督学习/大规模预训练
@@ -355,6 +369,23 @@ def train(args):
 
             global_step += 1 # 更新全局步数
 
+            # 定期在控制台打印训练信息
+            if global_step % args.log_per_steps == 0:
+                if is_student_phase:
+                    print(
+                        f"训练步数 {global_step}/{args.steps} | "
+                        f"阶段: 学生网络 | "
+                        f"余弦损失: {round(float(cosine_loss_val), 4)}"
+                    )
+                else:
+                    print(
+                        f"训练步数 {global_step}/{args.steps} | "
+                        f"阶段: 分割网络 | "
+                        f"Focal损失: {round(float(focal_loss_val), 4)} | "
+                        f"Dice损失: {round(float(dice_loss_val), 4)} | "
+                        f"总损失: {round(float(total_loss_val), 4)}"
+                    )
+
             # --- 阶段切换：加载最佳 S-T 模型 ---
             if global_step == args.de_st_steps:
                 if os.path.exists(best_st_state_path):
@@ -365,9 +396,6 @@ def train(args):
                     real_model.load_state_dict(torch.load(best_st_state_path))
                     # 重新将模型放到设备上 (以防万一)
                     real_model.to(device)
-
-            # --- 7. (移除) 原位置的日志记录已移动到上方条件块中 ---
-
 
             # 定期评估模型性能
             # 修改评估策略：仅在分割训练阶段进行定期评估，并在阶段开始和结束时强制评估
@@ -427,7 +455,7 @@ def train(args):
                     
                     vis_save_dir = None
                     if should_vis:
-                        vis_save_dir = os.path.join(args.vis_path, run_name, "gt_vs_pred")
+                        vis_save_dir = os.path.join(args.vis_dir, run_name, "gt_vs_pred")
                         if not os.path.exists(vis_save_dir):
                             os.makedirs(vis_save_dir)
 
@@ -471,23 +499,6 @@ def train(args):
                     real_model.student_net.eval()
                     real_model.segmentation_net.train()
 
-            # 定期在控制台打印训练信息
-            if global_step % args.log_per_steps == 0:
-                if is_student_phase:
-                    print(
-                        f"训练步数 {global_step}/{args.steps} | "
-                        f"阶段: 学生网络 | "
-                        f"余弦损失: {round(float(cosine_loss_val), 4)}"
-                    )
-                else:
-                    print(
-                        f"训练步数 {global_step}/{args.steps} | "
-                        f"阶段: 分割网络 | "
-                        f"Focal损失: {round(float(focal_loss_val), 4)} | "
-                        f"Dice损失: {round(float(dice_loss_val), 4)} | "
-                        f"总损失: {round(float(total_loss_val), 4)}"
-                    )
-
             # 检查是否达到总训练步数，如果是，则终止训练
             if global_step >= args.steps:
                 flag = False
@@ -498,7 +509,7 @@ def train(args):
     # 优先保存训练过程中通过 evaluate 选出的最佳模型 (best_seg_state_path)。
     # 如果没有生成最佳模型（例如未运行评估），则保存当前最后一步的模型。
     
-    final_model_path = os.path.join(args.checkpoint_path, run_name + ".pckl")
+    final_model_path = os.path.join(args.checkpoint_dir, run_name + ".pckl")
     
     if os.path.exists(best_seg_state_path):
         print(f"--- 训练完成，正在将最佳模型 (mIoU: {best_seg_metric:.4f}) 移动为最终结果 ---")
@@ -527,8 +538,8 @@ def train(args):
 
     # --- 9. 自动绘制并保存 Loss/Metric 曲线 ---
     print("--- 正在绘制并保存 Loss 和评估指标曲线 ---")
-    # 最终保存的目录是 args.vis_path/run_name/metrics
-    vis_save_dir = os.path.join(args.vis_path, run_name, "metrics")
+    # 最终保存的目录是 args.vis_dir/run_name/metrics
+    vis_save_dir = os.path.join(args.vis_dir, run_name, "metrics")
     save_metric_plots(log_dir, vis_save_dir)
 
 
@@ -554,10 +565,11 @@ if __name__ == "__main__":
     parser.add_argument('--random_rotate', type=int, default=0, help='随机旋转增强的最大角度 (0表示不启用)')
 
     # -- 模型与日志路径参数 --
-    parser.add_argument("--checkpoint_path", type=str, default="./saved_model/", help="保存模型检查点的路径")
+    parser.add_argument("--checkpoint_dir", type=str, default="./saved_model/", help="保存模型检查点的目录路径")
     parser.add_argument("--run_name_head", type=str, default="DeSTSeg_ROD", help="运行名称的前缀")
-    parser.add_argument("--log_path", type=str, default="./logs/", help="保存TensorBoard日志的路径")
-    parser.add_argument("--vis_path", type=str, default="./vis/", help="保存可视化图表的路径")
+    parser.add_argument("--log_dir", type=str, default="./logs/", help="保存TensorBoard日志的目录路径")
+    parser.add_argument("--vis_dir", type=str, default="./vis/", help="保存可视化图表的目录路径")
+    parser.add_argument("--terminal_output_dir", type=str, default="./terminal_output/", help="保存终端输出日志的目录路径")
     parser.add_argument("--vis_steps", type=int, nargs='+', default=[10, 20, 30, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
     parser.add_argument("--vis_num_images", type=int, default=16, help="每次详细可视化时保存的图像数量")
     parser.add_argument("--val_calc_aupro", action="store_true", help="是否在验证期间计算 AUPRO 指标 (耗时较长，默认关闭，仅在最后一步计算)")
