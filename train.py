@@ -136,8 +136,14 @@ def train(args):
     # num_classes: 设置为分类任务的类别数，包括背景。
     # dest=True: 启用student-teacher模式，学生网络将使用数据增强后的图像。
     # ed=True: 学生网络将包含一个解码器结构。
+    # use_d2t: 是否使用 WCA 和 PCA 增强结构
     # .to(device): 将模型的所有参数和缓冲区移动到先前选定的设备（GPU或CPU）。
-    model = DeSTSeg(num_classes=args.num_classes, dest=True, ed=True).to(device)
+    model = DeSTSeg(
+        num_classes=args.num_classes, 
+        dest=True, 
+        ed=True,
+        use_d2t=args.use_d2t
+    ).to(device)
 
     # --- 多卡训练支持 (DataParallel) ---
     if torch.cuda.device_count() > 1 and args.use_multi_gpu:
@@ -556,6 +562,7 @@ if __name__ == "__main__":
     parser.add_argument("--vis_num_images", type=int, default=16, help="每次详细可视化时保存的图像数量")
     parser.add_argument("--val_calc_aupro", action="store_true", help="是否在验证期间计算 AUPRO 指标 (耗时较长，默认关闭，仅在最后一步计算)")
     parser.add_argument("--num_classes", type=int, default=3, help="类别数量")
+    parser.add_argument("--use_d2t", action="store_true", help="是否启用 D2T (WCA + PCA) 模块增强特征表示")
 
     # -- 训练超参数 --
     parser.add_argument("--bs", type=int, default=32, help="训练的批量大小 (Batch Size)")
