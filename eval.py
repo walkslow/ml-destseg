@@ -2,6 +2,7 @@ import argparse
 import os
 import shutil
 import warnings
+import sys
 # 忽略所有警告 (包括 torchmetrics 产生的 pkg_resources 弃用警告)
 warnings.filterwarnings("ignore")
 
@@ -23,7 +24,7 @@ from constant import (
 # Dataset & Model
 from data.rod_dataset import RodDataset
 from model.destseg import DeSTSeg
-from model.model_utils import setup_seed, seed_worker
+from model.model_utils import setup_seed, seed_worker, DualLogger
 
 # Metrics
 from model.metrics import MulticlassSegmentationMetrics, MulticlassAUPRO
@@ -200,6 +201,35 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
 
 
 def test(args):
+    # --- 1. 确定 Checkpoint 和 Run Name ---
+    # 确定 checkpoint 路径
+    ckpt_path = os.path.join(args.checkpoint_dir, args.base_model_name + ".pckl")
+    if not os.path.exists(ckpt_path):
+        # 尝试不带 .pckl 后缀或其他命名格式，或者直接使用 args.checkpoint_dir 如果它是文件
+        if os.path.isfile(args.checkpoint_dir):
+            ckpt_path = args.checkpoint_dir
+        else:
+            # 在 Logger 初始化前报错，只能输出到终端
+            print(f"Error: Checkpoint not found at {ckpt_path}")
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+            
+    # 从 checkpoint 文件名生成 run_name
+    # 获取文件名（不带路径）
+    ckpt_filename = os.path.basename(ckpt_path)
+    # 去掉后缀名
+    ckpt_name_no_ext = os.path.splitext(ckpt_filename)[0]
+    
+    run_name = f"Test_{ckpt_name_no_ext}"
+    
+    # --- 2. 配置 DualLogger ---
+    if not os.path.exists(args.terminal_output_dir):
+        os.makedirs(args.terminal_output_dir)
+    terminal_log_path = os.path.join(args.terminal_output_dir, run_name + ".txt")
+    
+    original_stdout = sys.stdout
+    sys.stdout = DualLogger(terminal_log_path)
+    print(f"--- 终端输出将同时保存至: {terminal_log_path} ---")
+
     setup_seed(args.seed)
     start_time = datetime.now()
     print(f"--- 测试开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
@@ -211,27 +241,10 @@ def test(args):
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    if not os.path.exists(args.log_path):
-        os.makedirs(args.log_path)
+    if not os.path.exists(args.log_dir):
+        os.makedirs(args.log_dir)
     
-    # 确定 checkpoint 路径
-    ckpt_path = os.path.join(args.checkpoint_path, args.base_model_name + ".pckl")
-    if not os.path.exists(ckpt_path):
-        # 尝试不带 .pckl 后缀或其他命名格式，或者直接使用 args.checkpoint_path 如果它是文件
-        if os.path.isfile(args.checkpoint_path):
-            ckpt_path = args.checkpoint_path
-        else:
-            print(f"Error: Checkpoint not found at {ckpt_path}")
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-            
-    # 从 checkpoint 文件名生成 run_name
-    # 获取文件名（不带路径）
-    ckpt_filename = os.path.basename(ckpt_path)
-    # 去掉后缀名
-    ckpt_name_no_ext = os.path.splitext(ckpt_filename)[0]
-    
-    run_name = f"Test_{ckpt_name_no_ext}"
-    log_dir = os.path.join(args.log_path, run_name)
+    log_dir = os.path.join(args.log_dir, run_name)
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
 
@@ -245,7 +258,7 @@ def test(args):
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     
     # --- Visualization Setup ---
-    vis_save_dir = os.path.join(args.vis_path, run_name, "gt_vs_pred")
+    vis_save_dir = os.path.join(args.vis_dir, run_name, "gt_vs_pred")
     if not os.path.exists(vis_save_dir):
         os.makedirs(vis_save_dir)
 
@@ -258,7 +271,7 @@ def test(args):
 
     # --- 自动绘制并保存 Loss/Metric 曲线 ---
     print("--- 正在绘制并保存评估指标曲线 ---")
-    vis_save_dir = os.path.join(args.vis_path, run_name, "metrics")
+    vis_save_dir = os.path.join(args.vis_dir, run_name, "metrics")
     save_metric_plots(log_dir, vis_save_dir)
 
     end_time = datetime.now()
@@ -270,22 +283,23 @@ def test(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use. Set to -1 for CPU.")
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--gpu_id", type=int, default=0, help="指定使用的GPU编号。设置为 -1 表示使用 CPU。")
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载工作线程数")
     
     # 路径参数
-    parser.add_argument("--rod_dir", type=str, required=True, help="Path to test images directory")
-    parser.add_argument("--checkpoint_path", type=str, default="./saved_model/", help="Path to model checkpoint")
-    parser.add_argument("--base_model_name", type=str, default="DeSTSeg_Rod_Best", help="Model filename prefix")
-    parser.add_argument("--log_path", type=str, default="./logs/", help="Tensorboard log directory")
-    parser.add_argument("--vis_path", type=str, default="./vis/", help="Path to save visualization plots")
+    parser.add_argument("--rod_dir", type=str, required=True, help="测试图像目录的路径")
+    parser.add_argument("--checkpoint_dir", type=str, default="./saved_model/", help="模型检查点保存目录")
+    parser.add_argument("--base_model_name", type=str, default="DeSTSeg_Rod_Best", help="模型文件名前缀")
+    parser.add_argument("--log_dir", type=str, default="./logs/", help="TensorBoard 日志目录")
+    parser.add_argument("--vis_dir", type=str, default="./vis/", help="可视化结果保存目录")
+    parser.add_argument("--terminal_output_dir", type=str, default="./terminal_output/", help="终端输出日志保存目录")
 
     # 模型参数
-    parser.add_argument("--bs", type=int, default=16, help="Batch size")
-    parser.add_argument("--num_classes", type=int, default=4, help="Number of classes (including background)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--vis_gt_pred", action="store_true", help="Visualize GT and prediction")
-    parser.add_argument("--vis_num_images", type=int, default=4, help="Number of images to visualize")
+    parser.add_argument("--bs", type=int, default=16, help="批量大小")
+    parser.add_argument("--num_classes", type=int, default=3, help="类别数量（包含背景）")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--vis_gt_pred", action="store_true", help="是否可视化 GT 和预测结果")
+    parser.add_argument("--vis_num_images", type=int, default=16, help="可视化的图像数量")
 
     args = parser.parse_args()
 
