@@ -139,5 +139,6 @@ test_*.py
 terminal_output
 *.bat
 *.ps1
+*experiments.py
 
 .vscode
