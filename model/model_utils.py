@@ -11,6 +11,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+import sys
+
+class DualLogger(object):
+    """
+    一个简单的Logger类，将stdout重定向到文件和终端。
+    """
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding='utf-8')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush() # 确保实时写入
+
+    def flush(self):
+        # 兼容 python 的 file 接口
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
+
 
 def setup_seed(seed: int):
     """
