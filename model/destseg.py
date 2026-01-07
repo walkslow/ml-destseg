@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.model_utils import ASPP, BasicBlock, l2_normalize, make_layer
+from model.wp_modules import D2T_Attention
 
 
 class TeacherNet(nn.Module):
@@ -150,12 +151,27 @@ class DeSTSeg(nn.Module):
     - `ed`标志：传递给StudentNet，控制其是否包含解码器结构。
     """
 
-    def __init__(self, dest=True, ed=True, num_classes=4):
+    def __init__(self, dest=True, ed=True, num_classes=4, use_d2t=False):
         super().__init__()
         self.teacher_net = TeacherNet()
         self.student_net = StudentNet(ed)
         self.dest = dest  # 控制是否使用数据增强策略的标志位，这是为了和一般的T-S网络（T和S的输入相同）进行区别
-        self.segmentation_net = SegmentationNet(inplanes=448, num_classes=num_classes)
+
+        self.use_d2t = use_d2t
+        seg_inplanes = 448
+
+        if self.use_d2t:
+            # 如果启用 D2T，初始化 D2T_Attention 模块
+            # 对应 TeacherNet/StudentNet 的三个输出尺度，通道数分别为 64, 128, 256
+            self.d2t_modules = nn.ModuleList([
+                D2T_Attention(d_model=64),
+                D2T_Attention(d_model=128),
+                D2T_Attention(d_model=256)
+            ])
+            # 启用 D2T 后，SegmentationNet 的输入通道数翻倍 (原始差异特征 + D2T增强特征)
+            seg_inplanes *= 2
+
+        self.segmentation_net = SegmentationNet(inplanes=seg_inplanes, num_classes=num_classes)
 
     def forward(self, img_aug_l, img_aug_rgb, img_origin_l=None, img_origin_rgb=None):
         self.teacher_net.eval()
@@ -178,19 +194,36 @@ class DeSTSeg(nn.Module):
 
         # --- 特征融合策略 ---
         # 将教师和学生网络在不同尺度上的特征进行融合，作为分割网络的输入。
-        output = torch.cat(
-            [
-                F.interpolate(
-                    # 按元素相乘并取负，作为特征差异的度量。点积越大（越相似），差异值越小。
-                    -output_t * output_s,
-                    size=outputs_student_aug[0].size()[2:],  # 上采样到最大特征图的尺寸
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                for output_t, output_s in zip(outputs_teacher_aug, outputs_student_aug)
-            ],
-            dim=1,  # 沿通道维度拼接，得到 (64+128+256=448) 个通道的融合特征
-        )
+        fusion_features = []
+        for i, (output_t, output_s) in enumerate(zip(outputs_teacher_aug, outputs_student_aug)):
+            # 1. 原始差异特征计算
+            # 按元素相乘并取负，作为特征差异的度量。点积越大（越相似），差异值越小。
+            diff_feat = -output_t * output_s
+
+            # 2. D2T 结构增强 (如果启用)
+            if self.use_d2t:
+                # D2T_Attention 输入: Query=Teacher (Actual), Key=Student (Normal)
+                # 利用 Wavelet Pooling 和 Prototype Learning 增强特征表示
+                d2t_feat = self.d2t_modules[i](teacher=output_t, student=output_s)
+                # 将增强特征与原始差异特征拼接
+                scale_feat = torch.cat([diff_feat, d2t_feat], dim=1)
+            else:
+                scale_feat = diff_feat
+
+            # 3. 上采样对齐
+            # 上采样到最大特征图的尺寸 (outputs_student_aug[0] 的尺寸)
+            upsampled_feat = F.interpolate(
+                scale_feat,
+                size=outputs_student_aug[0].size()[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            fusion_features.append(upsampled_feat)
+
+        # 沿通道维度拼接，得到融合特征
+        # 未启用 D2T: 64+128+256 = 448 通道
+        # 启用 D2T: (64*2)+(128*2)+(256*2) = 896 通道
+        output = torch.cat(fusion_features, dim=1)
 
         # 将融合特征输入分割网络，得到像素级分割结果
         output_segmentation = self.segmentation_net(output)
