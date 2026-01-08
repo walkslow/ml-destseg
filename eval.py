@@ -230,6 +230,11 @@ def test(args):
     sys.stdout = DualLogger(terminal_log_path)
     print(f"--- 终端输出将同时保存至: {terminal_log_path} ---")
 
+    print("--- 命令行参数配置 ---")
+    for key, value in vars(args).items():
+        print(f"{key}: {value}")
+    print("----------------------")
+
     setup_seed(args.seed)
     start_time = datetime.now()
     print(f"--- 测试开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
