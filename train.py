@@ -36,6 +36,11 @@ def train(args):
     """
     # --- 1. 运行命名和日志设置 ---
     # 为了方便实验跟踪和比较，为每次运行生成一个唯一的名称。
+    
+    # 如果使用了 D2T，在 run_name_head 前加上前缀
+    if args.use_d2t:
+        args.run_name_head = "D2T_" + args.run_name_head
+
     # 名称由一个固定的前缀(run_name_head)、总训练步数(steps)和当前的日期时间戳构成。
     current_time = datetime.now().strftime("%Y%m%d%H%M")
     run_name = f"{args.run_name_head}_{args.steps}_{current_time}"
@@ -51,6 +56,11 @@ def train(args):
     sys.stdout = DualLogger(terminal_log_path)
     
     print(f"--- 终端输出将同时保存至: {terminal_log_path} ---")
+
+    print("--- 命令行参数配置 ---")
+    for key, value in vars(args).items():
+        print(f"{key}: {value}")
+    print("----------------------")
 
     start_time = datetime.now()
     print(f"--- 训练开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
@@ -277,6 +287,7 @@ def train(args):
 
     # 使用 "while" 循环和 "global_step" 实现基于步数（step-based）的训练，
     # 而非传统的基于轮次（epoch-based）的训练。这在需要精确控制迭代次数的场景中非常有用，适用于对比学习/自监督学习/大规模预训练
+    log_start_time = datetime.now()
     while flag:
         # 遍历数据加载器，获取每个批次的数据
         for _, sample_batched in enumerate(dataloader):
@@ -371,11 +382,16 @@ def train(args):
 
             # 定期在控制台打印训练信息
             if global_step % args.log_per_steps == 0:
+                current_time = datetime.now()
+                elapsed_time = current_time - log_start_time
+                log_start_time = current_time # 重置计时器
+                
                 if is_student_phase:
                     print(
                         f"训练步数 {global_step}/{args.steps} | "
                         f"阶段: 学生网络 | "
-                        f"余弦损失: {round(float(cosine_loss_val), 4)}"
+                        f"余弦损失: {round(float(cosine_loss_val), 4)} | "
+                        f"耗时: {elapsed_time}"
                     )
                 else:
                     print(
@@ -383,7 +399,8 @@ def train(args):
                         f"阶段: 分割网络 | "
                         f"Focal损失: {round(float(focal_loss_val), 4)} | "
                         f"Dice损失: {round(float(dice_loss_val), 4)} | "
-                        f"总损失: {round(float(total_loss_val), 4)}"
+                        f"总损失: {round(float(total_loss_val), 4)} | "
+                        f"耗时: {elapsed_time}"
                     )
 
             # --- 阶段切换：加载最佳 S-T 模型 ---
@@ -549,7 +566,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='使用DeSTSeg在ROD数据集上进行多分类分割')
 
     # -- 硬件与并行化参数 --
-    parser.add_argument("--gpu_id", type=int, nargs='+', default=[0, 1], help="指定使用的GPU编号。单卡如 '0'，多卡如 '0 1'，使用CPU如 '-1'")
+    parser.add_argument("--gpu_id", type=int, nargs='+', default=[0], help="指定使用的GPU编号。单卡如 '0'，多卡如 '0 1'，使用CPU如 '-1'")
     parser.add_argument("--num_workers", type=int, default=16, help="数据加载器使用的工作进程数")
 
     # -- 数据集路径参数 --
@@ -566,7 +583,7 @@ if __name__ == "__main__":
 
     # -- 模型与日志路径参数 --
     parser.add_argument("--checkpoint_dir", type=str, default="./saved_model/", help="保存模型检查点的目录路径")
-    parser.add_argument("--run_name_head", type=str, default="DeSTSeg_ROD", help="运行名称的前缀")
+    parser.add_argument("--run_name_head", type=str, default="DeSTSeg", help="运行名称的前缀")
     parser.add_argument("--log_dir", type=str, default="./logs/", help="保存TensorBoard日志的目录路径")
     parser.add_argument("--vis_dir", type=str, default="./vis/", help="保存可视化图表的目录路径")
     parser.add_argument("--terminal_output_dir", type=str, default="./terminal_output/", help="保存终端输出日志的目录路径")
@@ -577,7 +594,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_d2t", action="store_true", help="是否启用 D2T (WCA + PCA) 模块增强特征表示")
 
     # -- 训练超参数 --
-    parser.add_argument("--bs", type=int, default=32, help="训练的批量大小 (Batch Size)")
+    parser.add_argument("--bs", type=int, default=8, help="训练的批量大小 (Batch Size)")
     parser.add_argument("--lr_de_st", type=float, default=0.05, help="学生网络的学习率")
     parser.add_argument("--lr_res", type=float, default=0.0001, help="分割网络中ResNet部分的学习率")
     parser.add_argument("--lr_seghead", type=float, default=0.001, help="分割网络中分割头部分的学习率")
@@ -587,7 +604,7 @@ if __name__ == "__main__":
     parser.add_argument("--log_per_steps", type=int, default=50, help="每N步在控制台记录一次训练信息")
     parser.add_argument("--gamma", type=float, default=2, help="Focal Loss中的gamma参数")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，用于复现实验结果")
-    parser.add_argument("--grad_acc_steps", type=int, default=1, help="梯度累积步数，用于模拟更大的Batch Size。实际BS = bs * grad_acc_steps")
+    parser.add_argument("--grad_acc_steps", type=int, default=4, help="梯度累积步数，用于模拟更大的Batch Size。实际BS = bs * grad_acc_steps")
     parser.add_argument("--lambda_focal", type=float, default=20.0, help="Focal Loss 的权重系数")
     parser.add_argument("--lambda_dice", type=float, default=1.0, help="Dice Loss 的权重系数")
 
