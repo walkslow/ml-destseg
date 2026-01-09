@@ -37,9 +37,12 @@ def train(args):
     # --- 1. 运行命名和日志设置 ---
     # 为了方便实验跟踪和比较，为每次运行生成一个唯一的名称。
     
-    # 如果使用了 D2T，在 run_name_head 前加上前缀
-    if args.use_d2t:
+    # 如果使用了 D2T，且 run_name_head 中没有 D2T，则在 run_name_head 前加上前缀
+    if args.use_d2t and "D2T" not in args.run_name_head:
         args.run_name_head = "D2T_" + args.run_name_head
+
+    # 处理 rotate_90 逻辑：默认为 True，除非指定了 --no_rotate_90
+    args.rotate_90 = not args.no_rotate_90
 
     # 名称由一个固定的前缀(run_name_head)、总训练步数(steps)和当前的日期时间戳构成。
     current_time = datetime.now().strftime("%Y%m%d%H%M")
@@ -219,7 +222,6 @@ def train(args):
     print("--- 初始化训练数据集 ---")
     # 实例化RodDataset，用于加载和预处理数据
     dataset = RodDataset(
-        is_train=True, # 明确指定为训练模式
         # 传入各种缺陷数据的路径
         rod_dir=args.rod_dir,
         scratch_dir=args.scratch_dir,
@@ -228,6 +230,8 @@ def train(args):
         # 根据命令行参数动态设置数据增强选项
         rotate_90=args.rotate_90,
         random_rotate=args.random_rotate,
+        # 新增：控制是否使用真实数据
+        use_real_data=args.use_real_train_data,
         # 传入图像尺寸和归一化参数
         resize_shape=RESIZE_SHAPE,
         normalize_mean_l=NORMALIZE_MEAN_L,
@@ -254,14 +258,20 @@ def train(args):
     global_step = 0  # 初始化全局步数计数器，用于精确控制训练总长度
     flag = True      # 训练循环的控制标志
 
-    # 预加载验证集 DataLoader (如果指定了 test_dir)
+    # 预加载验证集 DataLoader (如果指定了 val_rod_dir)
     # 将其放在循环外，避免每次 evaluate 都重新扫描目录和创建 workers
     val_dataloader = None
-    if args.test_dir:
-        print(f"--- 预加载验证数据集: {args.test_dir} ---")
+    if args.val_rod_dir:
+        print(f"--- 预加载验证数据集: {args.val_rod_dir} ---")
         val_dataset = RodDataset(
-            is_train=False,
-            rod_dir=args.test_dir,
+            rod_dir=args.val_rod_dir,
+            scratch_dir=args.val_scratch_dir,
+            dent_dir=args.val_dent_dir,
+            dotted_dir=args.val_dotted_dir,
+            use_real_data=args.use_real_val_data,
+            # 验证集旋转增强参数与训练集一致
+            rotate_90=args.rotate_90,
+            random_rotate=args.random_rotate,
             resize_shape=RESIZE_SHAPE,
             normalize_mean_l=NORMALIZE_MEAN_L,
             normalize_std_l=NORMALIZE_STD_L,
@@ -417,7 +427,7 @@ def train(args):
             # 定期评估模型性能
             # 修改评估策略：仅在分割训练阶段进行定期评估，并在阶段开始和结束时强制评估
             should_run_eval = False
-            if args.test_dir:
+            if args.val_rod_dir:
                 # 1. 分割阶段开始前 (Phase 1 刚结束)
                 if global_step == args.de_st_steps:
                     should_run_eval = True
@@ -430,8 +440,7 @@ def train(args):
 
             if should_run_eval:
                 print(f"--- Running evaluation at step {global_step} ---")
-                eval_args = copy.copy(args)
-                eval_args.rod_dir = args.test_dir
+                
                 try:
                     # 估算分割阶段的总评估次数
                     seg_phase_steps = args.steps - args.de_st_steps
@@ -481,7 +490,8 @@ def train(args):
                     should_calc_aupro = args.val_calc_aupro or (global_step == args.steps)
 
                     # evaluate 现在返回指标字典
-                    metrics = evaluate(eval_args, model, visualizer, global_step,
+                    # 注意：直接传入 args 即可，因为我们传入了 dataloader，evaluate 内部不会使用 args 中的路径参数来创建数据集
+                    metrics = evaluate(args, model, visualizer, global_step,
                                        vis_gt_pred=should_vis,
                                        vis_save_dir=vis_save_dir,
                                        vis_num_images=args.vis_num_images,
@@ -570,16 +580,27 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=16, help="数据加载器使用的工作进程数")
 
     # -- 数据集路径参数 --
-    # default路径使用了 'r' 前缀来表示原始字符串，避免反斜杠 `\` 被错误解析。
-    parser.add_argument("--rod_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\good_7500\images", help="完好图像（good）的目录路径")
+    # default路径使用了 'r' 前缀来表示原始字符串，避免反斜杠 `\` 被错误解析
+    # 训练集参数
+    parser.add_argument("--rod_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\good_7500", help="训练集基准图像目录路径 (父目录，包含 images/)")
     parser.add_argument("--scratch_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\scratch_200", help="划痕缺陷（scratch）的目录路径")
     parser.add_argument("--dent_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\dent_300", help="凹痕缺陷（dent）的目录路径")
     parser.add_argument("--dotted_dir", type=str, default=None, help="点状缺陷（dotted）的目录路径 (可选)")
-    parser.add_argument("--test_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\images", help="测试集图像目录路径 (用于训练中评估)")
+    
+    # 验证集参数
+    parser.add_argument("--val_rod_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\good_900", help="验证集图像目录路径 (用于训练中评估)")
+    parser.add_argument("--val_scratch_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\scratch_79", help="验证集划痕缺陷目录 (可选)")
+    parser.add_argument("--val_dent_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\dent_50", help="验证集凹痕缺陷目录 (可选)")
+    parser.add_argument("--val_dotted_dir", type=str, default=None, help="验证集点状缺陷目录 (可选)")
+
+    # 控制使用真实数据，还是合成数据
+    parser.add_argument("--use_real_train_data", action='store_true', help="训练时是否使用真实缺陷数据 (默认为False，即使用合成)")
+    parser.add_argument("--use_real_val_data", action='store_true', help="验证时是否使用真实缺陷数据 (默认为False，即使用合成)")
     
     # -- 数据增强参数 --
-    parser.add_argument('--rotate_90', action='store_true', help='启用90度旋转数据增强')
-    parser.add_argument('--random_rotate', type=int, default=0, help='随机旋转增强的最大角度 (0表示不启用)')
+    # 修改：默认开启旋转增强，提供 --no_rotate_90 参数来关闭
+    parser.add_argument('--no_rotate_90', action='store_true', help='禁用90度旋转数据增强')
+    parser.add_argument('--random_rotate', type=int, default=10, help='随机旋转增强的最大角度 (0表示不启用)')
 
     # -- 模型与日志路径参数 --
     parser.add_argument("--checkpoint_dir", type=str, default="./saved_model/", help="保存模型检查点的目录路径")
