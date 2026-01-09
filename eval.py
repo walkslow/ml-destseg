@@ -62,8 +62,13 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
         if dataloader is None:
             print(f"Loading test data from: {args.rod_dir}")
             dataset = RodDataset(
-                is_train=False,
                 rod_dir=args.rod_dir,
+                scratch_dir=getattr(args, 'scratch_dir', None),
+                dent_dir=getattr(args, 'dent_dir', None),
+                dotted_dir=getattr(args, 'dotted_dir', None),
+                use_real_data=getattr(args, 'use_real_data', True), # 默认为True (兼容旧代码或未传参情况)
+                rotate_90=getattr(args, 'rotate_90', False),
+                random_rotate=getattr(args, 'random_rotate', 0),
                 resize_shape=RESIZE_SHAPE,
                 normalize_mean_l=NORMALIZE_MEAN_L,
                 normalize_std_l=NORMALIZE_STD_L,
@@ -201,6 +206,16 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
 
 
 def test(args):
+    # 处理 rotate_90 逻辑
+    if hasattr(args, 'no_rotate_90'):
+        args.rotate_90 = not args.no_rotate_90
+    else:
+        # 如果从其他地方调用test且没有传入no_rotate_90，保留原有的rotate_90或默认为False
+        # 这里的 fallback 主要是为了防止直接调用test(args)时args对象没有no_rotate_90属性报错
+        # 但如果是通过命令行进来，argparse保证了no_rotate_90存在
+        if not hasattr(args, 'rotate_90'):
+             args.rotate_90 = True # 默认开启，与命令行行为一致
+
     # --- 1. 确定 Checkpoint 和 Run Name ---
     # 确定 checkpoint 路径
     ckpt_path = os.path.join(args.checkpoint_dir, args.base_model_name + ".pckl")
@@ -292,7 +307,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载工作线程数")
     
     # 路径参数
-    parser.add_argument("--rod_dir", type=str, required=True, help="测试图像目录的路径")
+    parser.add_argument("--rod_dir", type=str, required=True, help="测试图像目录的路径 (父目录，包含 images/)")
+    # 新增缺陷目录参数 (用于合成测试)
+    parser.add_argument("--scratch_dir", type=str, default=None, help="划痕缺陷目录 (可选)")
+    parser.add_argument("--dent_dir", type=str, default=None, help="凹痕缺陷目录 (可选)")
+    parser.add_argument("--dotted_dir", type=str, default=None, help="点状缺陷目录 (可选)")
+
     parser.add_argument("--checkpoint_dir", type=str, default="./saved_model/", help="模型检查点保存目录")
     parser.add_argument("--base_model_name", type=str, default="DeSTSeg_Rod_Best", help="模型文件名前缀")
     parser.add_argument("--log_dir", type=str, default="./logs/", help="TensorBoard 日志目录")
@@ -305,7 +325,12 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--vis_gt_pred", action="store_true", help="是否可视化 GT 和预测结果")
     parser.add_argument("--vis_num_images", type=int, default=16, help="可视化的图像数量")
+    
+    # 新增参数 (与 RodDataset 对应)
+    parser.add_argument("--use_real_data", action="store_true", help="是否使用真实数据 (默认为False，即使用合成)")
+    parser.add_argument('--no_rotate_90', action='store_true', help='禁用90度旋转数据增强')
+    parser.add_argument('--random_rotate', type=int, default=0, help='随机旋转增强的最大角度 (0表示不启用)')
 
     args = parser.parse_args()
-
+    
     test(args)
