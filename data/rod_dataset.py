@@ -30,13 +30,12 @@ class RodDataset(Dataset):
     该数据集的核心是为学生-教师网络框架提供数据：
     - 学生网络（StudentNet）接收单通道灰度图。
     - 教师网络（TeacherNet）接收三通道RGB图。
-    - 在训练时，通过`cut_paste`方法在正常图像上合成缺陷，生成增强图像和对应的掩码。
-    - 在测试时，加载图像和对应的真实掩码。
+    - 当 use_real_data=False 时（合成模式），通过`cut_paste`方法在正常图像上合成缺陷，生成增强图像和对应的掩码。
+    - 当 use_real_data=True 时（真实模式），加载真实图像和对应的真实掩码。
     """
 
     def __init__(
         self,
-        is_train,
         rod_dir,
         resize_shape=[256, 256],
         normalize_mean_l=[0.5],
@@ -48,10 +47,15 @@ class RodDataset(Dataset):
         dotted_dir=None,
         rotate_90=False,
         random_rotate=0,
+        use_real_data=False,
     ):
         super().__init__()
         self.resize_shape = resize_shape
-        self.is_train = is_train
+        self.use_real_data = use_real_data
+
+        # 如果未指定任何缺陷源目录，自动切换到真实数据模式
+        if scratch_dir is None and dent_dir is None and dotted_dir is None:
+            self.use_real_data = True
 
         # --- 为学生网络（灰度图）和教师网络（RGB图）定义不同的预处理管道 ---
         # 学生网络使用单通道灰度图，归一化参数通常设为[0.5], [0.5]
@@ -69,9 +73,24 @@ class RodDataset(Dataset):
             ]
         )
 
-        if is_train:
-            # --- 训练模式下的初始化 ---
-            self.rod_paths = sorted(glob.glob(rod_dir + "/*.png"))
+        # 统一路径逻辑：rod_dir 应该是包含 images/ 和 labels/ 的父目录
+        # 尝试从 rod_dir/images 加载
+        self.rod_paths = sorted(glob.glob(os.path.join(rod_dir, "images", "*.png")))
+        # 如果为空，尝试直接从 rod_dir 加载 (兼容旧的路径格式或纯背景文件夹)
+        if len(self.rod_paths) == 0:
+            self.rod_paths = sorted(glob.glob(os.path.join(rod_dir, "*.png")))
+
+        # 数据增强相关参数
+        # 如果使用真实数据，强制关闭旋转增强 (根据用户需求：若使用真实图片而非合成图片，则不进行旋转增强)
+        if self.use_real_data:
+            self.rotate_90 = False
+            self.random_rotate = 0
+        else:
+            self.rotate_90 = rotate_90
+            self.random_rotate = random_rotate
+
+        if not self.use_real_data:
+            # --- 合成模式下的初始化 ---
             # 加载用于合成缺陷的图像和掩码路径
             self.scratch_dir = scratch_dir
             self.scratch_img_paths = sorted(glob.glob(scratch_dir + "/images" + "/*.png")) if scratch_dir else None
@@ -82,39 +101,28 @@ class RodDataset(Dataset):
             self.dotted_dir = dotted_dir
             self.dotted_img_paths = sorted(glob.glob(dotted_dir + "/images" + "/*.png")) if dotted_dir else None
             self.dotted_msk_paths = sorted(glob.glob(dotted_dir + "/labels" + "/*.png")) if dotted_dir else None
-            # 数据增强相关参数
-            self.rotate_90 = rotate_90
-            self.random_rotate = random_rotate
 
             # 训练掩码预处理器：cut_paste返回的PIL掩码，其像素值就是类别ID，
             # 且尺寸已对齐，所以只需要直接转换为LongTensor。
             self.mask_preprocessing = PILToLongTensor()
         else:
-            # --- 测试/评估模式下的初始化 ---
-            self.rod_paths = sorted(glob.glob(rod_dir + "/*.png"))
+            # --- 真实模式下的初始化 ---
             # 测试掩码预处理器：从文件加载的PIL掩码，其像素值也是类别ID，
             # 但需要先进行Resize以匹配模型输入尺寸，然后再转换为LongTensor。
-            self.mask_preprocessing = transforms.Compose(
-                [
-                    transforms.Resize(
-                        size=(self.resize_shape[1], self.resize_shape[0]),
-                        interpolation=transforms.InterpolationMode.NEAREST, # 掩码必须使用最近邻插值
-                    ),
-                    PILToLongTensor(),
-                ]
-            )
+            # 注意：Resize操作被移到了__getitem__中，以便和图像进行同步旋转增强(如果启用)
+            self.mask_preprocessing = PILToLongTensor()
 
     def __len__(self):
         return len(self.rod_paths)
 
     def __getitem__(self, index):
-        # --- 1. 加载并预处理原始无缺陷图像 ---
+        # --- 1. 加载并预处理图像 ---
         # 统一以灰度模式（'L'）加载，因为所有操作（如cut_paste）都基于灰度图
         image = Image.open(self.rod_paths[index]).convert("L")
         image = image.resize(self.resize_shape, Image.BILINEAR)
 
-        if self.is_train:
-            # --- 2. 训练模式：加载缺陷、执行数据增强和cut_paste ---
+        if not self.use_real_data:
+            # --- 2. 合成模式：加载缺陷、执行数据增强和cut_paste ---
             # 随机加载用于合成的缺陷图像和掩码
             if self.scratch_dir:
                 defect_idx = torch.randint(0, len(self.scratch_img_paths), (1,)).item()
@@ -176,27 +184,56 @@ class RodDataset(Dataset):
                 "mask": aug_mask                  # 增强图对应的分割掩码
             }
         else:
-            # --- 2. 测试模式：加载真实掩码并统一返回格式 ---
+            # --- 2. 真实模式：加载真实掩码并统一返回格式 ---
             # 加载与图像对应的真实掩码
             dir_path, file_name = os.path.split(self.rod_paths[index])
+            # 尝试标准结构: rod_dir/labels/file.png
+            # 如果 rod_paths 来自 rod_dir/images/file.png，则替换 images 为 labels
             mask_path = os.path.join(dir_path.replace("images", "labels"), file_name)
-            if not os.path.exists(mask_path): # 兼容train/good/images这种路径
+            
+            # 兼容性检查：如果替换后不存在，尝试回退到同级目录查找 labels (针对非标准结构)
+            if not os.path.exists(mask_path):
+                # 尝试在上级目录找 labels
                 mask_path = os.path.join(os.path.dirname(dir_path), "labels", file_name)
-            mask = Image.open(mask_path)
+
+            if os.path.exists(mask_path):
+                mask = Image.open(mask_path)
+            else:
+                # 如果找不到掩码，直接报错
+                raise FileNotFoundError(f"找不到对应的掩码文件: {mask_path}，对应的图像为: {self.rod_paths[index]}")
+
+            # 调整掩码尺寸 (使用最近邻插值保持类别ID)
+            mask = mask.resize(self.resize_shape, Image.NEAREST)
+
+            # --- 数据增强 (旋转) ---
+            # 注意：虽然构造函数中已强制关闭了真实数据的旋转，但保留此代码逻辑以防将来策略变更，
+            # 或者如果用户显式希望在真实数据上做增强（需修改构造函数逻辑）。
+            # 目前 self.rotate_90 和 self.random_rotate 在 use_real_data=True 时已被置为 False/0。
+            if self.rotate_90 or self.random_rotate > 0:
+                degree = 0
+                if self.rotate_90:
+                    degree += np.random.choice(np.array([0, 90, 180, 270]))
+                if self.random_rotate > 0:
+                    degree += np.random.uniform(-self.random_rotate, self.random_rotate)
+                
+                if degree != 0:
+                    fill_color = 0
+                    image = image.rotate(degree, fillcolor=fill_color, resample=Image.BILINEAR)
+                    mask = mask.rotate(degree, fillcolor=0, resample=Image.NEAREST)
+
             mask = self.mask_preprocessing(mask)
 
             # --- 3. 生成灰度图和RGB图对 ---
-            image_l = self.image_preprocessing_l(image)
-            image_rgb = self.image_preprocessing_rgb(image.convert("RGB"))
+            # 在真实模式下，img_aug 和 img_origin 都是加载的真实图像
+            image_l_tensor = self.image_preprocessing_l(image)
+            image_rgb_tensor = self.image_preprocessing_rgb(image.convert("RGB"))
 
             # --- 4. 统一返回字典格式 ---
-            # 在测试模式下，没有数据增强，因此"origin"和"aug"图像是相同的。
-            # 这样可以确保无论训练还是测试，Dataloader返回的批次数据结构一致。
             return {
-                "img_origin_l": image_l,
-                "img_origin_rgb": image_rgb,
-                "img_aug_l": image_l.clone(), # 使用clone避免潜在的引用问题
-                "img_aug_rgb": image_rgb.clone(),
+                "img_origin_l": image_l_tensor,
+                "img_origin_rgb": image_rgb_tensor,
+                "img_aug_l": image_l_tensor.clone(), # 使用clone避免潜在的引用问题
+                "img_aug_rgb": image_rgb_tensor.clone(),
                 "mask": mask
             }
 
