@@ -87,6 +87,10 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
             )
         else:
             print(f"Using pre-loaded dataloader with {len(dataloader.dataset)} samples")
+            # 重置 generator 种子以确保每次评估时的随机增强（如旋转、缺陷合成）结果一致
+            if dataloader.generator is not None:
+                seed = args.seed if hasattr(args, 'seed') else 42
+                dataloader.generator.manual_seed(seed)
 
         for _, sample_batched in enumerate(dataloader):
             # 获取输入数据 (移动到设备)
