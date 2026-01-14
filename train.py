@@ -24,6 +24,7 @@ from eval import evaluate # 评估函数
 from model.model_utils import setup_seed, seed_worker, get_scheduler, DualLogger
 from model.destseg import DeSTSeg
 from model.losses import cosine_similarity_loss, focal_loss, dice_loss
+from model.adaptive_loss import create_adaptive_loss, UncertaintyWeightingLoss
 from visualize import save_metric_plots
 
 
@@ -182,9 +183,48 @@ def train(args):
     else:
         real_model = model
 
+    # --- 自适应损失权重初始化 ---
+    adaptive_loss_fn = None
+    if args.adaptive_loss_method:
+        print(f"--- 启用自适应损失权重调整: {args.adaptive_loss_method} ---")
+        if args.adaptive_loss_method == 'dynamic':
+            # 动态权重调整 (无需参数，在训练循环中调用)
+            adaptive_loss_fn = create_adaptive_loss(
+                method='dynamic',
+                base_weights=[args.lambda_focal, args.lambda_dice],
+                adjust_factor=args.adaptive_adjust_factor,
+                warmup_steps=args.adaptive_warmup_steps,
+                smoothing_window=args.adaptive_smoothing_window
+            )
+            print(f"    基础权重: Focal={args.lambda_focal}, Dice={args.lambda_dice}")
+            print(f"    调整因子: {args.adaptive_adjust_factor}, 预热步数: {args.adaptive_warmup_steps}")
+        elif args.adaptive_loss_method == 'uncertainty':
+            # 不确定性权重 (作为可学习模块)
+            adaptive_loss_fn = create_adaptive_loss(
+                method='uncertainty',
+                num_losses=2,
+                init_log_vars=[args.adaptive_init_log_var] * 2
+            ).to(device)
+            print(f"    初始log方差: {args.adaptive_init_log_var}")
+            print(f"    将权重参数添加到优化器进行学习")
+        elif args.adaptive_loss_method == 'autoweight':
+            # 自动权重
+            adaptive_loss_fn = create_adaptive_loss(
+                method='autoweight',
+                num_losses=2,
+                init_weights=[args.lambda_focal, args.lambda_dice]
+            ).to(device)
+            print(f"    初始权重: Focal={args.lambda_focal}, Dice={args.lambda_dice}")
+            print(f"    将权重参数添加到优化器进行学习")
+        else:
+            print(f"--- 警告: 未知的自适应损失方法 {args.adaptive_loss_method}，将使用固定权重 ---")
+            adaptive_loss_fn = None
+    else:
+        print("--- 使用固定损失权重 ---")
+
     # --- 4. 优化器与学习率调度设置 ---
     # 采用两阶段训练策略，因此需要为学生网络和分割网络分别设置优化器和调度器。
-    
+
     # 4.1 分割网络优化器
     seg_optimizer = torch.optim.SGD(
         [
@@ -196,6 +236,13 @@ def train(args):
         weight_decay=1e-4,
         nesterov=False,
     )
+
+    # 如果使用 uncertainty 或 autoweight 方法，将权重参数添加到优化器
+    if adaptive_loss_fn and args.adaptive_loss_method in ['uncertainty', 'autoweight']:
+        seg_optimizer.add_param_group({
+            "params": adaptive_loss_fn.parameters(),
+            "lr": args.lr_seghead  # 使用与分割头相同的学习率
+        })
     
     # 4.2 学生网络优化器
     de_st_optimizer = torch.optim.SGD(
@@ -369,9 +416,26 @@ def train(args):
                 # 计算分割网络的损失
                 focal_loss_val = focal_loss(output_segmentation, mask, gamma=args.gamma)
                 dice_loss_val = dice_loss(output_segmentation, mask)
-                # 使用命令行参数控制损失权重
-                total_loss_val = args.lambda_focal * focal_loss_val + args.lambda_dice * dice_loss_val
-                
+
+                # 使用自适应权重或固定权重计算总损失
+                if adaptive_loss_fn:
+                    if args.adaptive_loss_method == 'dynamic':
+                        # 动态权重调整
+                        lambda_focal, lambda_dice = adaptive_loss_fn.get_weights(
+                            [focal_loss_val, dice_loss_val],
+                            global_step - args.de_st_steps  # 分割阶段的相对步数
+                        )
+                        total_loss_val = lambda_focal * focal_loss_val + lambda_dice * dice_loss_val
+                    else:
+                        # uncertainty 或 autoweight 方法
+                        total_loss_val, weights = adaptive_loss_fn([focal_loss_val, dice_loss_val])
+                        lambda_focal, lambda_dice = weights
+                else:
+                    # 使用固定权重
+                    lambda_focal = args.lambda_focal
+                    lambda_dice = args.lambda_dice
+                    total_loss_val = lambda_focal * focal_loss_val + lambda_dice * dice_loss_val
+
                 # 梯度累积：损失除以累积步数
                 (total_loss_val / args.grad_acc_steps).backward()
 
@@ -384,6 +448,12 @@ def train(args):
                 visualizer.add_scalar("Loss/Focal_Loss", focal_loss_val, global_step + 1)
                 visualizer.add_scalar("Loss/Dice_Loss", dice_loss_val, global_step + 1)
                 visualizer.add_scalar("Loss/Total_Loss", total_loss_val, global_step + 1)
+
+                # 记录自适应权重变化
+                if adaptive_loss_fn:
+                    visualizer.add_scalar("Adaptive_Weights/Focal_Weight", lambda_focal, global_step + 1)
+                    visualizer.add_scalar("Adaptive_Weights/Dice_Weight", lambda_dice, global_step + 1)
+
                 # 分别记录 ResNet (Backbone) 和 Head 的学习率
                 visualizer.add_scalar("LR/Seg_ResNet", seg_optimizer.param_groups[0]["lr"], global_step + 1)
                 visualizer.add_scalar("LR/Seg_Head", seg_optimizer.param_groups[1]["lr"], global_step + 1)
@@ -404,14 +474,27 @@ def train(args):
                         f"耗时: {elapsed_time}"
                     )
                 else:
-                    print(
-                        f"训练步数 {global_step}/{args.steps} | "
-                        f"阶段: 分割网络 | "
-                        f"Focal损失: {round(float(focal_loss_val), 4)} | "
-                        f"Dice损失: {round(float(dice_loss_val), 4)} | "
-                        f"总损失: {round(float(total_loss_val), 4)} | "
-                        f"耗时: {elapsed_time}"
-                    )
+                    # 分割阶段：根据是否使用自适应权重显示不同信息
+                    if adaptive_loss_fn:
+                        print(
+                            f"训练步数 {global_step}/{args.steps} | "
+                            f"阶段: 分割网络 | "
+                            f"Focal损失: {round(float(focal_loss_val), 4)} | "
+                            f"Dice损失: {round(float(dice_loss_val), 4)} | "
+                            f"Focal权重: {round(float(lambda_focal), 2)} | "
+                            f"Dice权重: {round(float(lambda_dice), 2)} | "
+                            f"总损失: {round(float(total_loss_val), 4)} | "
+                            f"耗时: {elapsed_time}"
+                        )
+                    else:
+                        print(
+                            f"训练步数 {global_step}/{args.steps} | "
+                            f"阶段: 分割网络 | "
+                            f"Focal损失: {round(float(focal_loss_val), 4)} | "
+                            f"Dice损失: {round(float(dice_loss_val), 4)} | "
+                            f"总损失: {round(float(total_loss_val), 4)} | "
+                            f"耗时: {elapsed_time}"
+                        )
 
             # --- 阶段切换：加载最佳 S-T 模型 ---
             if global_step == args.de_st_steps:
@@ -628,6 +711,18 @@ if __name__ == "__main__":
     parser.add_argument("--grad_acc_steps", type=int, default=4, help="梯度累积步数，用于模拟更大的Batch Size。实际BS = bs * grad_acc_steps")
     parser.add_argument("--lambda_focal", type=float, default=20.0, help="Focal Loss 的权重系数")
     parser.add_argument("--lambda_dice", type=float, default=1.0, help="Dice Loss 的权重系数")
+
+    # -- 自适应损失权重参数 --
+    parser.add_argument("--adaptive_loss_method", type=str, default=None, choices=['dynamic', 'uncertainty', 'autoweight', None],
+                        help="自适应损失权重调整方法: 'dynamic'(动态调整), 'uncertainty'(不确定性权重), 'autoweight'(自动权重), None(固定权重)")
+    parser.add_argument("--adaptive_adjust_factor", type=float, default=0.5,
+                        help="动态权重调整的强度因子 (0-1)，仅在 dynamic 模式下生效。0表示不调整，越大调整越剧烈")
+    parser.add_argument("--adaptive_warmup_steps", type=int, default=1000,
+                        help="自适应权重的预热步数，在此期间使用基础权重，仅在 dynamic 模式下生效")
+    parser.add_argument("--adaptive_smoothing_window", type=int, default=10,
+                        help="损失值的平滑窗口大小，用于减少权重波动，仅在 dynamic 模式下生效")
+    parser.add_argument("--adaptive_init_log_var", type=float, default=0.0,
+                        help="不确定性权重的初始log方差值，仅在 uncertainty 模式下生效")
 
     # 解析命令行传入的参数
     args = parser.parse_args()
