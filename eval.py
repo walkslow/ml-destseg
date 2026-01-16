@@ -25,6 +25,7 @@ from constant import (
 from data.rod_dataset import RodDataset
 from model.destseg import DeSTSeg
 from model.model_utils import setup_seed, seed_worker, DualLogger
+from model.patchcore_mem import MemoryBank
 
 # Metrics
 from model.metrics import MulticlassSegmentationMetrics, MulticlassAUPRO
@@ -32,7 +33,7 @@ from visualize import save_metric_plots
 from draw import save_visual_comparison
 
 
-def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save_dir=None, vis_num_images=4, calc_aupro=True, dataloader=None):
+def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save_dir=None, vis_num_images=4, calc_aupro=True, dataloader=None, memory_bank=None):
     model.eval()
     
     device = next(model.parameters()).device
@@ -102,8 +103,8 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
 
             # 模型前向传播
             # 注意：测试模式下 img_aug 和 img_origin 是一样的，但 DeSTSeg 接口需要传入
-            output_segmentation, _, _ = model(
-                img_aug_l, img_aug_rgb, img_origin_l, img_origin_rgb
+            output_segmentation, _, _, _ = model(
+                img_aug_l, img_aug_rgb, img_origin_l, img_origin_rgb, memory_bank=memory_bank
             )
 
             # 将预测结果插值到原始 mask 尺寸 (如果 mask 尺寸与模型输出不同)
@@ -275,11 +276,29 @@ def test(args):
     visualizer = SummaryWriter(log_dir=log_dir)
 
     # 初始化模型并移动到指定设备
-    model = DeSTSeg(dest=True, ed=True, num_classes=args.num_classes).to(device)
+    model = DeSTSeg(
+        dest=True, 
+        ed=True, 
+        num_classes=args.num_classes,
+        use_d2t=args.use_d2t,
+        use_patchcore=args.use_patchcore
+    ).to(device)
 
     print(f"Loading checkpoint: {ckpt_path}")
     # 这里的 map_location 确保权重能加载到正确的设备上（即使用户在 CPU 机器上加载 GPU 训练的权重）
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    
+    # --- Load Memory Bank if provided ---
+    memory_bank = None
+    if args.use_patchcore and args.mem_bank_path:
+        if os.path.exists(args.mem_bank_path):
+            print(f"Loading Memory Bank from: {args.mem_bank_path}")
+            # 初始化 MemoryBank，device 会在 predict 时自动处理，但这里先传 device
+            memory_bank = MemoryBank(device=device) 
+            memory_bank.load(args.mem_bank_path)
+            print("Memory Bank loaded successfully.")
+        else:
+            print(f"Warning: Memory Bank path provided but file not found: {args.mem_bank_path}")
     
     # --- Visualization Setup ---
     vis_save_dir = os.path.join(args.vis_dir, run_name, "gt_vs_pred")
@@ -287,7 +306,7 @@ def test(args):
         os.makedirs(vis_save_dir)
 
     # 传递 vis_gt_pred=True 以及相关参数，以便在测试时生成可视化图像
-    evaluate(args, model, visualizer, global_step=0, vis_gt_pred=args.vis_gt_pred, vis_save_dir=vis_save_dir, vis_num_images=args.vis_num_images)
+    evaluate(args, model, visualizer, global_step=0, vis_gt_pred=args.vis_gt_pred, vis_save_dir=vis_save_dir, vis_num_images=args.vis_num_images, memory_bank=memory_bank)
 
     # 确保所有数据写入磁盘
     visualizer.flush()
@@ -334,6 +353,11 @@ if __name__ == "__main__":
     parser.add_argument("--use_real_data", action="store_true", help="是否使用真实数据 (默认为False，即使用合成)")
     parser.add_argument('--no_rotate_90', action='store_true', help='禁用90度旋转数据增强')
     parser.add_argument('--random_rotate', type=int, default=0, help='随机旋转增强的最大角度 (0表示不启用)')
+    
+    # 新增模型配置参数
+    parser.add_argument("--use_d2t", action="store_true", help="是否启用 D2T 模块")
+    parser.add_argument("--use_patchcore", action="store_true", help="是否启用 PatchCore 记忆库")
+    parser.add_argument("--mem_bank_path", type=str, default=None, help="PatchCore 记忆库文件路径 (.pt)")
 
     args = parser.parse_args()
     
