@@ -25,6 +25,7 @@ from model.model_utils import setup_seed, seed_worker, get_scheduler, DualLogger
 from model.destseg import DeSTSeg
 from model.losses import cosine_similarity_loss, focal_loss, dice_loss
 from model.adaptive_loss import create_adaptive_loss, UncertaintyWeightingLoss
+from model.patchcore_mem import PatchMaker, MemoryBank # 引入 PatchCore 组件
 from visualize import save_metric_plots
 
 
@@ -38,6 +39,10 @@ def train(args):
     # --- 1. 运行命名和日志设置 ---
     # 为了方便实验跟踪和比较，为每次运行生成一个唯一的名称。
     
+    # 如果使用了 PatchCore，且 run_name_head 中没有 MemB，则在 run_name_head 前加上前缀
+    if args.use_patchcore and "MemB" not in args.run_name_head:
+        args.run_name_head = "MemB_" + args.run_name_head
+
     # 如果使用了 D2T，且 run_name_head 中没有 D2T，则在 run_name_head 前加上前缀
     if args.use_d2t and "D2T" not in args.run_name_head:
         args.run_name_head = "D2T_" + args.run_name_head
@@ -170,7 +175,8 @@ def train(args):
         num_classes=args.num_classes, 
         dest=True, 
         ed=True,
-        use_d2t=args.use_d2t
+        use_d2t=args.use_d2t,
+        use_patchcore=args.use_patchcore
     ).to(device)
 
     # --- 多卡训练支持 (DataParallel) ---
@@ -305,6 +311,47 @@ def train(args):
     global_step = 0  # 初始化全局步数计数器，用于精确控制训练总长度
     flag = True      # 训练循环的控制标志
 
+    # --- PatchCore 初始化 ---
+    memory_bank = None
+    memory_bank_features_list = [] # 用于暂存特征 (放在 CPU)
+    num_samples_collected = 0
+    total_train_samples = len(dataset)
+    memory_bank_finalized = False
+    
+    # --- PatchCore 参数校验与自动修正 ---
+    if args.use_patchcore:
+        import math
+        # 计算遍历一次训练集所需的最小步数
+        # 实际 batch size = args.bs * args.grad_acc_steps
+        actual_bs = args.bs * args.grad_acc_steps
+        min_steps_for_one_epoch = math.ceil(total_train_samples / actual_bs)
+        
+        if args.de_st_steps < min_steps_for_one_epoch:
+            print(f"--- 警告: de_st_steps ({args.de_st_steps}) 小于完成一轮 Epoch 所需步数 ({min_steps_for_one_epoch}) ---")
+            print(f"--- 自动修正: de_st_steps 调整为 {min_steps_for_one_epoch} ---")
+            
+            # 调整 Phase 1 步数
+            diff = min_steps_for_one_epoch - args.de_st_steps
+            args.de_st_steps = min_steps_for_one_epoch
+            
+            # 同样增加总步数，保持 Phase 2 训练时长不变
+            args.steps += diff
+            print(f"--- 自动修正: 总训练步数 steps 调整为 {args.steps} ---")
+            
+            # 更新 Scheduler 需要的步数变量
+            st_steps = args.de_st_steps
+            seg_steps = args.steps - args.de_st_steps
+            
+            # 重新创建 Scheduler
+            de_st_scheduler = get_scheduler(de_st_optimizer, st_steps)
+            seg_scheduler = get_scheduler(seg_optimizer, seg_steps)
+
+    
+    if args.use_patchcore:
+        print(f"--- 启用 PatchCore: 采样率 {args.patchcore_ratio}, 预计总样本数 {total_train_samples} ---")
+        # MemoryBank 负责存储和搜索，注意这里的 device 是用于后续计算距离的主设备
+        memory_bank = MemoryBank(device)
+
     # 预加载验证集 DataLoader (如果指定了 val_rod_dir)
     # 将其放在循环外，避免每次 evaluate 都重新扫描目录和创建 workers
     val_dataloader = None
@@ -373,16 +420,45 @@ def train(args):
                 real_model.segmentation_net.train() # 仅分割网络处于训练模式
 
             # --- 前向传播 ---
-            # 将数据输入模型，获取三个关键输出
+            # 将数据输入模型，获取四个关键输出
             # output_segmentation: 分割网络的最终输出, shape: (N, C, H, W)
             # output_de_st: 学生-教师网络融合后的单尺度异常图, shape: (N, 1, H, W)
             # output_de_st_list: 学生-教师网络在不同特征层级的多尺度异常图列表
-            output_segmentation, output_de_st, output_de_st_list = model(
+            # patchcore_features: 学生-教师网络在教师特征层级的特征图，用于 PatchCore 记忆库构建
+            output_segmentation, output_de_st, output_de_st_list, patchcore_features = model(
                 img_origin_l=img_origin_l,     # 原始灰度图，用于分割网络
                 img_origin_rgb=img_origin_rgb, # 原始RGB图，用于教师网络
                 img_aug_l=img_aug_l,           # 增强后的灰度图，用于学生网络
-                img_aug_rgb=img_aug_rgb        # 增强后的RGB图，当前模型实现中未使用
+                img_aug_rgb=img_aug_rgb,       # 增强后的RGB图，当前模型实现中未使用
+                memory_bank=memory_bank if memory_bank_finalized else None        # 传入 PatchCore 记忆库
             )
+
+            # --- PatchCore 特征收集 ---
+            if args.use_patchcore and not memory_bank_finalized and patchcore_features is not None:
+                # 移动到 CPU 并缓存
+                memory_bank_features_list.append(patchcore_features.cpu())
+                
+                # 更新计数
+                num_samples_collected += img_origin_rgb.shape[0]
+                
+                # 检查是否已收集足够的数据
+                if num_samples_collected >= total_train_samples:
+                    print(f"--- PatchCore: 已收集 {num_samples_collected}/{total_train_samples} 样本，开始构建记忆库... ---")
+                    
+                    # 合并所有特征
+                    all_features = torch.cat(memory_bank_features_list, dim=0)
+                    
+                    # 构建记忆库 (核心集采样)
+                    memory_bank.fit(all_features, sampling_ratio=args.patchcore_ratio)
+                    
+                    # 保存记忆库
+                    bank_save_path = os.path.join(args.checkpoint_dir, f"{run_name}_memory_bank.pt")
+                    memory_bank.save(bank_save_path)
+                    
+                    # 清理缓存
+                    memory_bank_features_list = []
+                    memory_bank_finalized = True
+                    print("--- PatchCore: 记忆库构建完成并保存 ---")
 
             # --- 损失计算、反向传播与日志记录 ---
             if is_student_phase:
@@ -579,7 +655,8 @@ def train(args):
                                        vis_save_dir=vis_save_dir,
                                        vis_num_images=args.vis_num_images,
                                        calc_aupro=should_calc_aupro,
-                                       dataloader=val_dataloader)
+                                       dataloader=val_dataloader,
+                                       memory_bank=memory_bank)
                     
                     # 仅在第二阶段 (分割训练) 跟踪最佳分割模型
                     # 注意：global_step == args.de_st_steps 时也是评估分割模型(尽管还没开始训练分割头，作为baseline)
@@ -668,13 +745,13 @@ if __name__ == "__main__":
     parser.add_argument("--rod_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\good_7500", help="训练集基准图像目录路径 (父目录，包含 images/)")
     parser.add_argument("--scratch_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\scratch_200", help="划痕缺陷（scratch）的目录路径")
     parser.add_argument("--dent_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\dent_300", help="凹痕缺陷（dent）的目录路径")
-    parser.add_argument("--dotted_dir", type=str, default=None, help="点状缺陷（dotted）的目录路径 (可选)")
+    parser.add_argument("--dotted_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\dotted_100", help="点状缺陷（dotted）的目录路径 (可选)")
     
     # 验证集参数
     parser.add_argument("--val_rod_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\good_900", help="验证集图像目录路径 (用于训练中评估)")
     parser.add_argument("--val_scratch_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\scratch_79", help="验证集划痕缺陷目录 (可选)")
     parser.add_argument("--val_dent_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\dent_50", help="验证集凹痕缺陷目录 (可选)")
-    parser.add_argument("--val_dotted_dir", type=str, default=None, help="验证集点状缺陷目录 (可选)")
+    parser.add_argument("--val_dotted_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\dotted_19", help="验证集点状缺陷目录 (可选)")
 
     # 控制使用真实数据，还是合成数据
     parser.add_argument("--use_real_train_data", action='store_true', help="训练时是否使用真实缺陷数据 (默认为False，即使用合成)")
@@ -694,7 +771,7 @@ if __name__ == "__main__":
     parser.add_argument("--vis_steps", type=int, nargs='+', default=[10, 20, 30, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
     parser.add_argument("--vis_num_images", type=int, default=16, help="每次详细可视化时保存的图像数量")
     parser.add_argument("--val_calc_aupro", action="store_true", help="是否在验证期间计算 AUPRO 指标 (耗时较长，默认关闭，仅在最后一步计算)")
-    parser.add_argument("--num_classes", type=int, default=3, help="类别数量")
+    parser.add_argument("--num_classes", type=int, default=4, help="类别数量")
     parser.add_argument("--use_d2t", action="store_true", help="是否启用 D2T (WCA + PCA) 模块增强特征表示")
 
     # -- 训练超参数 --
@@ -724,6 +801,10 @@ if __name__ == "__main__":
     parser.add_argument("--adaptive_init_log_var", type=float, default=0.0,
                         help="不确定性权重的初始log方差值，仅在 uncertainty 模式下生效")
 
+    # PatchCore 记忆库相关参数
+    parser.add_argument("--use_patchcore", action="store_true", help="是否启用 PatchCore 记忆库")
+    parser.add_argument("--patchcore_ratio", type=float, default=0.01, help="PatchCore 记忆库采样比例")
+
     # 解析命令行传入的参数
     args = parser.parse_args()
 
@@ -731,3 +812,4 @@ if __name__ == "__main__":
     # 调用主训练函数，并传入解析后的参数。
     # 设备选择逻辑已在train函数内部处理，此处无需额外操作。
     train(args)
+
