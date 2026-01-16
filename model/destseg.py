@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from model.model_utils import ASPP, BasicBlock, l2_normalize, make_layer
 from model.wp_modules import D2T_Attention
+from model.patchcore_mem import PatchMaker
 
 
 class TeacherNet(nn.Module):
@@ -151,13 +152,14 @@ class DeSTSeg(nn.Module):
     - `ed`标志：传递给StudentNet，控制其是否包含解码器结构。
     """
 
-    def __init__(self, dest=True, ed=True, num_classes=4, use_d2t=False):
+    def __init__(self, dest=True, ed=True, num_classes=4, use_d2t=False, use_patchcore=False):
         super().__init__()
         self.teacher_net = TeacherNet()
         self.student_net = StudentNet(ed)
         self.dest = dest  # 控制是否使用数据增强策略的标志位，这是为了和一般的T-S网络（T和S的输入相同）进行区别
 
         self.use_d2t = use_d2t
+        self.use_patchcore = use_patchcore
         seg_inplanes = 448
 
         if self.use_d2t:
@@ -171,9 +173,15 @@ class DeSTSeg(nn.Module):
             # 启用 D2T 后，SegmentationNet 的输入通道数翻倍 (原始差异特征 + D2T增强特征)
             seg_inplanes *= 2
 
+        if self.use_patchcore:
+            # 如果启用 PatchCore，增加一个输入通道 (Anomaly Map)
+            seg_inplanes += 1
+            # 初始化 PatchMaker 用于特征对齐 (参数需与 train.py 中一致)
+            self.patch_maker = PatchMaker(patchsize=3, stride=1)
+
         self.segmentation_net = SegmentationNet(inplanes=seg_inplanes, num_classes=num_classes)
 
-    def forward(self, img_aug_l, img_aug_rgb, img_origin_l=None, img_origin_rgb=None):
+    def forward(self, img_aug_l, img_aug_rgb, img_origin_l=None, img_origin_rgb=None, memory_bank=None):
         self.teacher_net.eval()
 
         # --- 处理推理（inference）时输入不完整的情况 ---
@@ -184,13 +192,52 @@ class DeSTSeg(nn.Module):
 
         # --- 1. 计算用于分割网络输入的融合特征 ---
         # 教师网络处理增强后的RGB图像
+        # 获取原始特征用于 PatchCore (如果启用)
+        teacher_features_aug = self.teacher_net(img_aug_rgb)
         outputs_teacher_aug = [
-            l2_normalize(output_t.detach()) for output_t in self.teacher_net(img_aug_rgb)
+            l2_normalize(output_t.detach()) for output_t in teacher_features_aug
         ]
         # 学生网络处理增强后的灰度图像
         outputs_student_aug = [
             l2_normalize(output_s) for output_s in self.student_net(img_aug_l)
         ]
+
+        # --- PatchCore Anomaly Map Calculation ---
+        patchcore_map = None
+        patchcore_features = None # Phase 1: 返回特征以供收集
+
+        if self.use_patchcore:
+            target_size = outputs_student_aug[0].size()[2:] # 目标对齐尺寸
+            
+            # 统一特征提取逻辑：无论 Phase 1 还是 Phase 2，都需要提取特征
+            # features: (B*H*W, D), spatial_info: (B, H, W)
+            features, (b, h, w) = self.patch_maker.patchify(teacher_features_aug, return_spatial_info=True)
+
+            if memory_bank is not None:
+                 # Phase 2 (or Inference): 记忆库已构建，计算异常图
+                 
+                 # 计算距离 (Anomaly Score)
+                 # distances: (B*H*W, )
+                 distances = memory_bank.predict(features)
+                 
+                 # Reshape 回空间尺寸 (B, 1, H, W)
+                 patchcore_map = distances.reshape(b, 1, h, w)
+                 
+                 # 上采样对齐到最大特征图尺寸
+                 patchcore_map = F.interpolate(
+                    patchcore_map,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False
+                 )
+            else:
+                 # Phase 1: 记忆库未构建，返回特征供收集
+                 
+                 # 生成占位符异常图 (B, 1, H, W)
+                 patchcore_map = torch.zeros((b, 1, *target_size), device=img_aug_rgb.device)
+                 
+                 # 返回 detached 特征以节省显存 (用于构建记忆库)
+                 patchcore_features = features.detach()
 
         # --- 特征融合策略 ---
         # 将教师和学生网络在不同尺度上的特征进行融合，作为分割网络的输入。
@@ -224,6 +271,10 @@ class DeSTSeg(nn.Module):
         # 未启用 D2T: 64+128+256 = 448 通道
         # 启用 D2T: (64*2)+(128*2)+(256*2) = 896 通道
         output = torch.cat(fusion_features, dim=1)
+        
+        if self.use_patchcore:
+             # 拼接 PatchCore Anomaly Map
+             output = torch.cat([output, patchcore_map], dim=1)
 
         # 将融合特征输入分割网络，得到像素级分割结果
         output_segmentation = self.segmentation_net(output)
@@ -274,4 +325,5 @@ class DeSTSeg(nn.Module):
         # output_segmentation: 分割网络的原始logits输出 [N, num_classes, H, W]
         # output_de_st: 融合后的单通道综合异常图 [N, 1, H, W]
         # output_de_st_list: 融合前的多尺度异常图列表，每个元素为 [N, 1, H, W]
-        return output_segmentation, output_de_st, output_de_st_list
+        
+        return output_segmentation, output_de_st, output_de_st_list, patchcore_features
