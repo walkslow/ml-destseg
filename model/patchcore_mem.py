@@ -2,7 +2,76 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import tqdm
+import os
+import glob
 from typing import Union, List
+from PIL import Image
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+
+
+class MemoryBankSourceDataset(Dataset):
+    """
+    专门用于构建 PatchCore 记忆库的数据集。
+    仅加载原始正常图像，不进行合成缺陷，仅进行基础预处理（Resize, Normalize）。
+    """
+    def __init__(self, img_dir, resize_shape, mean_l, std_l, mean_rgb, std_rgb, rotate_90=False, random_rotate=0):
+        self.img_paths = sorted(glob.glob(os.path.join(img_dir, "*.png")))
+        # 兼容 images 子目录结构
+        if len(self.img_paths) == 0:
+            self.img_paths = sorted(glob.glob(os.path.join(img_dir, "images", "*.png")))
+        
+        if len(self.img_paths) == 0:
+            raise ValueError(f"在目录 {img_dir} 中未找到 PNG 图像")
+
+        self.resize_shape = resize_shape
+        self.rotate_90 = rotate_90
+        self.random_rotate = random_rotate
+        
+        self.transform_l = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean_l, std_l)
+        ])
+        self.transform_rgb = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean_rgb, std_rgb)
+        ])
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        # 统一以灰度模式加载
+        image = Image.open(self.img_paths[idx]).convert("L")
+        image = image.resize(self.resize_shape, Image.BILINEAR)
+
+        # 旋转增强 (如果启用)
+        fill_color = 0
+        if self.rotate_90:
+            degree = int(torch.randint(0, 4, (1,)).item() * 90) # 0, 90, 180, 270
+            if degree != 0:
+                image = image.rotate(degree, fillcolor=fill_color, resample=Image.BILINEAR)
+        if self.random_rotate > 0:
+            degree = float(torch.empty(1).uniform_(-self.random_rotate, self.random_rotate).item())
+            image = image.rotate(degree, fillcolor=fill_color, resample=Image.BILINEAR)
+
+        # 生成 RGB 版本
+        image_rgb = image.convert("RGB")
+        
+        # 转换和归一化
+        img_l = self.transform_l(image)
+        img_rgb = self.transform_rgb(image_rgb)
+        
+        # 返回字典以匹配 train 循环的某些预期 (虽然这里我们主要直接取 tensor)
+        # 注意：这里 img_aug 和 img_origin 相同，因为没有合成缺陷
+        return {
+            "img_origin_l": img_l,
+            "img_origin_rgb": img_rgb,
+            "img_aug_l": img_l.clone(),
+            "img_aug_rgb": img_rgb.clone(),
+            # mask 不需要，因为我们不计算损失，只提取特征
+        }
+
 
 class PatchMaker:
     """
@@ -307,6 +376,26 @@ class MemoryBank:
         self.memory_bank = sampler.run(features)
         print(f"记忆库构建完成，最终特征数量: {self.memory_bank.shape[0]}")
         
+    def save(self, path: str):
+        """
+        保存记忆库到文件。
+        """
+        if self.memory_bank is None:
+            print("警告：记忆库为空，无法保存。")
+            return
+        torch.save(self.memory_bank, path)
+        print(f"记忆库已保存至 {path}")
+
+    def load(self, path: str):
+        """
+        从文件加载记忆库。
+        """
+        if not os.path.exists(path):
+            print(f"警告：记忆库文件 {path} 不存在。")
+            return
+        self.memory_bank = torch.load(path, map_location=self.device)
+        print(f"记忆库已从 {path} 加载，特征数量: {self.memory_bank.shape[0]}")
+
     def predict(self, features: torch.Tensor, n_neighbors: int = 1):
         """
         计算特征到记忆库的最近邻距离。
@@ -361,12 +450,3 @@ class MemoryBank:
         
         return torch.cat(distances_list, dim=0)
 
-    def save(self, path: str):
-        """保存记忆库到文件"""
-        torch.save(self.memory_bank, path)
-        print(f"记忆库已保存至: {path}")
-        
-    def load(self, path: str):
-        """从文件加载记忆库"""
-        self.memory_bank = torch.load(path, map_location=self.device)
-        print(f"记忆库已加载，大小: {self.memory_bank.shape}")
