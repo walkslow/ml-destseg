@@ -8,12 +8,12 @@ import sys
 # 忽略所有警告 (包括 torchmetrics 产生的 pkg_resources 弃用警告)
 warnings.filterwarnings("ignore")
 
-import copy
 from datetime import datetime
 
 # 导入PyTorch核心包
 import torch
 import torch.nn.functional as F
+import tqdm
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
@@ -24,10 +24,9 @@ from eval import evaluate # 评估函数
 from model.model_utils import setup_seed, seed_worker, get_scheduler, DualLogger
 from model.destseg import DeSTSeg
 from model.losses import cosine_similarity_loss, focal_loss, dice_loss
-from model.adaptive_loss import create_adaptive_loss, UncertaintyWeightingLoss
-from model.patchcore_mem import PatchMaker, MemoryBank # 引入 PatchCore 组件
+from model.adaptive_loss import create_adaptive_loss
+from model.patchcore_mem import MemoryBank, MemoryBankSourceDataset # 引入 PatchCore 组件
 from visualize import save_metric_plots
-
 
 def train(args):
     """
@@ -318,8 +317,80 @@ def train(args):
     total_train_samples = len(dataset)
     memory_bank_finalized = False
     
-    # --- PatchCore 参数校验与自动修正 ---
     if args.use_patchcore:
+        print(f"--- 启用 PatchCore: 采样率 {args.patchcore_ratio}, 预计总样本数 {total_train_samples} ---")
+        # MemoryBank 负责存储和搜索，注意这里的 device 是用于后续计算距离的主设备
+        memory_bank = MemoryBank(device)
+
+        # --- 记忆库预构建逻辑 ---
+        if args.use_prebuild_memory_bank and args.memory_bank_source_dir:
+            print(f"--- 预构建记忆库: 使用原始正常图像 {args.memory_bank_source_dir} ---")
+            
+            # 创建专用数据集
+            # 旋转增强策略：如果训练启用旋转，记忆库也应该包含旋转后的特征以覆盖特征空间
+            mb_dataset = MemoryBankSourceDataset(
+                img_dir=args.memory_bank_source_dir,
+                resize_shape=RESIZE_SHAPE,
+                mean_l=NORMALIZE_MEAN_L,
+                std_l=NORMALIZE_STD_L,
+                mean_rgb=NORMALIZE_MEAN_RGB,
+                std_rgb=NORMALIZE_STD_RGB,
+                rotate_90=args.rotate_90,
+                random_rotate=args.random_rotate
+            )
+            
+            # 使用较大的 batch_size 加速提取 (仅做推理)
+            mb_dataloader = DataLoader(mb_dataset, batch_size=args.bs, shuffle=False, num_workers=args.num_workers)
+            
+            model.eval()
+            all_features_list = []
+            
+            print(f"--- 开始提取特征 (数据集大小: {len(mb_dataset)}) ---")
+            with torch.no_grad():
+                for batch in tqdm.tqdm(mb_dataloader, desc="提取记忆库特征"):
+                    img_aug_l = batch["img_aug_l"].to(device)
+                    img_aug_rgb = batch["img_aug_rgb"].to(device)
+                    
+                    # 传入 memory_bank=None 触发 Phase 1 逻辑，提取特征
+                    # 注意：如果是 DataParallel，需要确保参数传递正确
+                    # DeSTSeg forward: (img_aug_l, img_aug_rgb, img_origin_l, img_origin_rgb, memory_bank)
+                    # 我们显式传递，利用 kwargs
+                    _, _, _, patchcore_features = model(
+                        img_aug_l=img_aug_l, 
+                        img_aug_rgb=img_aug_rgb, 
+                        memory_bank=None
+                    )
+                    
+                    if patchcore_features is not None:
+                        all_features_list.append(patchcore_features.cpu())
+            
+            if all_features_list:
+                all_features = torch.cat(all_features_list, dim=0)
+                print(f"--- 特征提取完成，总特征数: {all_features.shape[0]}，开始构建核心集 ---")
+                memory_bank.fit(all_features, sampling_ratio=args.patchcore_ratio)
+                
+                # 保存
+                save_path = os.path.join(args.checkpoint_dir, f"{run_name}_memory_bank_prebuilt.pt")
+                if not os.path.exists(args.checkpoint_dir):
+                    os.makedirs(args.checkpoint_dir)
+                memory_bank.save(save_path)
+                
+                memory_bank_finalized = True
+                print(f"--- 记忆库预构建完成并已保存至 {save_path}，跳过后续训练中的构建步骤 ---")
+                
+                # 恢复模型训练模式 (虽然 Phase 1 主要训练 Student，Teacher 始终 eval)
+                # 但主循环会处理 model.train() / eval()
+            else:
+                print("--- 警告: 未提取到任何特征，记忆库预构建失败，将回退到训练中构建 ---")
+                memory_bank_finalized = False
+        else:
+            memory_bank_finalized = False
+    else:
+        memory_bank_finalized = False
+
+    # --- PatchCore 参数校验与自动修正 ---
+    # 仅当 memory_bank 未预构建完成时，才强制要求 Phase 1 遍历整个数据集
+    if args.use_patchcore and not memory_bank_finalized:
         import math
         # 计算遍历一次训练集所需的最小步数
         # 实际 batch size = args.bs * args.grad_acc_steps
@@ -345,12 +416,6 @@ def train(args):
             # 重新创建 Scheduler
             de_st_scheduler = get_scheduler(de_st_optimizer, st_steps)
             seg_scheduler = get_scheduler(seg_optimizer, seg_steps)
-
-    
-    if args.use_patchcore:
-        print(f"--- 启用 PatchCore: 采样率 {args.patchcore_ratio}, 预计总样本数 {total_train_samples} ---")
-        # MemoryBank 负责存储和搜索，注意这里的 device 是用于后续计算距离的主设备
-        memory_bank = MemoryBank(device)
 
     # 预加载验证集 DataLoader (如果指定了 val_rod_dir)
     # 将其放在循环外，避免每次 evaluate 都重新扫描目录和创建 workers
@@ -430,7 +495,8 @@ def train(args):
                 img_origin_rgb=img_origin_rgb, # 原始RGB图，用于教师网络
                 img_aug_l=img_aug_l,           # 增强后的灰度图，用于学生网络
                 img_aug_rgb=img_aug_rgb,       # 增强后的RGB图，当前模型实现中未使用
-                memory_bank=memory_bank if memory_bank_finalized else None        # 传入 PatchCore 记忆库
+                # 传入 PatchCore 记忆库: 仅在记忆库已构建且不在学生训练阶段时传入，以加速 Phase 1
+                memory_bank=memory_bank if (memory_bank_finalized and not is_student_phase) else None
             )
 
             # --- PatchCore 特征收集 ---
@@ -738,54 +804,45 @@ if __name__ == "__main__":
     # -- 硬件与并行化参数 --
     parser.add_argument("--gpu_id", type=int, nargs='+', default=[0], help="指定使用的GPU编号。单卡如 '0'，多卡如 '0 1'，使用CPU如 '-1'")
     parser.add_argument("--num_workers", type=int, default=16, help="数据加载器使用的工作进程数")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子，用于复现实验结果")
 
-    # -- 数据集路径参数 --
+    # -- 数据集路径参数 (训练) --
     # default路径使用了 'r' 前缀来表示原始字符串，避免反斜杠 `\` 被错误解析
-    # 训练集参数
     parser.add_argument("--rod_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\good_7500", help="训练集基准图像目录路径 (父目录，包含 images/)")
     parser.add_argument("--scratch_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\scratch_200", help="划痕缺陷（scratch）的目录路径")
     parser.add_argument("--dent_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\dent_300", help="凹痕缺陷（dent）的目录路径")
     parser.add_argument("--dotted_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\dotted_100", help="点状缺陷（dotted）的目录路径 (可选)")
-    
-    # 验证集参数
+    parser.add_argument("--use_real_train_data", action='store_true', help="训练时是否使用真实缺陷数据 (默认为False，即使用合成)")
+
+    # -- 数据集路径参数 (验证) --
     parser.add_argument("--val_rod_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\good_900", help="验证集图像目录路径 (用于训练中评估)")
     parser.add_argument("--val_scratch_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\scratch_79", help="验证集划痕缺陷目录 (可选)")
     parser.add_argument("--val_dent_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\dent_50", help="验证集凹痕缺陷目录 (可选)")
     parser.add_argument("--val_dotted_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\eval\dotted_19", help="验证集点状缺陷目录 (可选)")
-
-    # 控制使用真实数据，还是合成数据
-    parser.add_argument("--use_real_train_data", action='store_true', help="训练时是否使用真实缺陷数据 (默认为False，即使用合成)")
     parser.add_argument("--use_real_val_data", action='store_true', help="验证时是否使用真实缺陷数据 (默认为False，即使用合成)")
-    
+
     # -- 数据增强参数 --
     # 修改：默认开启旋转增强，提供 --no_rotate_90 参数来关闭
     parser.add_argument('--no_rotate_90', action='store_true', help='禁用90度旋转数据增强')
     parser.add_argument('--random_rotate', type=int, default=10, help='随机旋转增强的最大角度 (0表示不启用)')
 
-    # -- 模型与日志路径参数 --
-    parser.add_argument("--checkpoint_dir", type=str, default="./saved_model/", help="保存模型检查点的目录路径")
-    parser.add_argument("--run_name_head", type=str, default="DeSTSeg", help="运行名称的前缀")
-    parser.add_argument("--log_dir", type=str, default="./logs/", help="保存TensorBoard日志的目录路径")
-    parser.add_argument("--vis_dir", type=str, default="./vis/", help="保存可视化图表的目录路径")
-    parser.add_argument("--terminal_output_dir", type=str, default="./terminal_output/", help="保存终端输出日志的目录路径")
-    parser.add_argument("--vis_steps", type=int, nargs='+', default=[10, 20, 30, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
-    parser.add_argument("--vis_num_images", type=int, default=16, help="每次详细可视化时保存的图像数量")
-    parser.add_argument("--val_calc_aupro", action="store_true", help="是否在验证期间计算 AUPRO 指标 (耗时较长，默认关闭，仅在最后一步计算)")
-    parser.add_argument("--num_classes", type=int, default=4, help="类别数量")
+    # -- D2T 和 PatchCore 记忆库相关参数 --
     parser.add_argument("--use_d2t", action="store_true", help="是否启用 D2T (WCA + PCA) 模块增强特征表示")
+    parser.add_argument("--use_patchcore", action="store_true", help="是否启用 PatchCore 记忆库")
+    parser.add_argument("--patchcore_ratio", type=float, default=0.01, help="PatchCore 记忆库采样比例")
+    parser.add_argument("--memory_bank_source_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\good_75", help="用于构建PatchCore记忆库的原始正常图像(未复制扩充)目录 (通常不包含合成缺陷)")
+    parser.add_argument("--use_prebuild_memory_bank", action='store_true', help="是否在训练前使用原始正常图像预构建记忆库 (避免使用增强后的冗余数据)")
 
-    # -- 训练超参数 --
+    # -- 模型与训练超参数 --
+    parser.add_argument("--num_classes", type=int, default=4, help="类别数量")    
     parser.add_argument("--bs", type=int, default=8, help="训练的批量大小 (Batch Size)")
+    parser.add_argument("--grad_acc_steps", type=int, default=4, help="梯度累积步数，用于模拟更大的Batch Size。实际BS = bs * grad_acc_steps")
+    parser.add_argument("--steps", type=int, default=10000, help="总训练步数")
+    parser.add_argument("--de_st_steps", type=int, default=2500, help="第一阶段训练学生网络的步数")
     parser.add_argument("--lr_de_st", type=float, default=0.05, help="学生网络的学习率")
     parser.add_argument("--lr_res", type=float, default=0.0001, help="分割网络中ResNet部分的学习率")
     parser.add_argument("--lr_seghead", type=float, default=0.001, help="分割网络中分割头部分的学习率")
-    parser.add_argument("--steps", type=int, default=10000, help="总训练步数")
-    parser.add_argument("--de_st_steps", type=int, default=2500, help="第一阶段训练学生网络的步数")
-    parser.add_argument("--eval_per_steps", type=int, default=200, help="在训练分割网络的过程中每N步评估一次模型")
-    parser.add_argument("--log_per_steps", type=int, default=50, help="每N步在控制台记录一次训练信息")
     parser.add_argument("--gamma", type=float, default=2, help="Focal Loss中的gamma参数")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子，用于复现实验结果")
-    parser.add_argument("--grad_acc_steps", type=int, default=4, help="梯度累积步数，用于模拟更大的Batch Size。实际BS = bs * grad_acc_steps")
     parser.add_argument("--lambda_focal", type=float, default=20.0, help="Focal Loss 的权重系数")
     parser.add_argument("--lambda_dice", type=float, default=1.0, help="Dice Loss 的权重系数")
 
@@ -801,9 +858,17 @@ if __name__ == "__main__":
     parser.add_argument("--adaptive_init_log_var", type=float, default=0.0,
                         help="不确定性权重的初始log方差值，仅在 uncertainty 模式下生效")
 
-    # PatchCore 记忆库相关参数
-    parser.add_argument("--use_patchcore", action="store_true", help="是否启用 PatchCore 记忆库")
-    parser.add_argument("--patchcore_ratio", type=float, default=0.01, help="PatchCore 记忆库采样比例")
+    # -- 日志与可视化参数 --
+    parser.add_argument("--checkpoint_dir", type=str, default="./saved_model/", help="保存模型检查点的目录路径")
+    parser.add_argument("--run_name_head", type=str, default="DeSTSeg", help="运行名称的前缀")
+    parser.add_argument("--log_dir", type=str, default="./logs/", help="保存TensorBoard日志的目录路径")
+    parser.add_argument("--vis_dir", type=str, default="./vis/", help="保存可视化图表的目录路径")
+    parser.add_argument("--terminal_output_dir", type=str, default="./terminal_output/", help="保存终端输出日志的目录路径")
+    parser.add_argument("--log_per_steps", type=int, default=50, help="每N步在控制台记录一次训练信息")
+    parser.add_argument("--eval_per_steps", type=int, default=200, help="在训练分割网络的过程中每N步评估一次模型")
+    parser.add_argument("--vis_steps", type=int, nargs='+', default=[10, 20, 30, -2, -1], help="指定需要进行详细可视化（GT vs Pred）的评估步骤序号。1表示第一次，-1表示最后一次。设置为0表示不进行。")
+    parser.add_argument("--vis_num_images", type=int, default=16, help="每次详细可视化时保存的图像数量")
+    parser.add_argument("--val_calc_aupro", action="store_true", help="是否在验证期间计算 AUPRO 指标 (耗时较长，默认关闭，仅在最后一步计算)")
 
     # 解析命令行传入的参数
     args = parser.parse_args()
