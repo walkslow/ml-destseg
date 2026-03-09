@@ -95,3 +95,32 @@ def save_visual_comparison(images, masks, save_path, nrow=2):
     ndarr = np.clip(ndarr, 0, 1)
     
     plt.imsave(save_path, ndarr)
+
+def save_raw_images(images, save_path, nrow=2):
+    """
+    保存原始图像网格 (无 mask 叠加)
+    images: List of tensors (C, H, W)
+    save_path: 保存路径
+    """
+    vis_list = []
+    
+    for img_t in images:
+        # img_np: (H, W, 3) float [0, 1]
+        img_np = denormalize(img_t) 
+        
+        # HWC -> CHW (Tensor)
+        vis_tensor = torch.from_numpy(img_np.transpose(2, 0, 1)).float()
+        vis_list.append(vis_tensor)
+        
+    # 拼接成网格
+    grid = make_grid(vis_list, nrow=nrow, padding=2)
+    
+    # 确保目录存在
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    # 保存
+    ndarr = grid.permute(1, 2, 0).numpy()
+    # Clip to [0, 1] just in case
+    ndarr = np.clip(ndarr, 0, 1)
+    
+    plt.imsave(save_path, ndarr)
