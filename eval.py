@@ -30,7 +30,7 @@ from model.patchcore_mem import MemoryBank
 # Metrics
 from model.metrics import MulticlassSegmentationMetrics, MulticlassAUPRO
 from visualize import save_metric_plots
-from draw import save_visual_comparison
+from draw import save_visual_comparison, save_raw_images
 
 
 def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save_dir=None, vis_num_images=4, calc_aupro=True, dataloader=None, memory_bank=None):
@@ -161,6 +161,11 @@ def evaluate(args, model, visualizer, global_step=0, vis_gt_pred=False, vis_save
             if not os.path.exists(gt_save_path):
                  save_visual_comparison(vis_imgs_accum, vis_gt_accum, gt_save_path, nrow=int(vis_num_images**0.5) if vis_num_images > 1 else 1)
             
+            # Save Raw only once if it doesn't exist (similar to GT logic)
+            raw_save_path = os.path.join(vis_save_dir, "raw.png")
+            if not os.path.exists(raw_save_path):
+                 save_raw_images(vis_imgs_accum, raw_save_path, nrow=int(vis_num_images**0.5) if vis_num_images > 1 else 1)
+
             print(f"Saved visualization to {vis_save_dir}")
 
         # --- 计算并打印结果 ---
