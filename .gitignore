@@ -131,6 +131,7 @@ dmypy.json
 # custom
 saved_model
 datasets
+dataset
 .out
 logs
 offline_packages
@@ -140,5 +141,6 @@ terminal_output
 *.bat
 *.ps1
 *experiments.py
+todo*
 
 .vscode

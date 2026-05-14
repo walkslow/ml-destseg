@@ -38,6 +38,19 @@ def train(args):
     # --- 1. 运行命名和日志设置 ---
     # 为了方便实验跟踪和比较，为每次运行生成一个唯一的名称。
     
+    # 处理 Adaptive Loss Method 前缀
+    if args.adaptive_loss_method:
+        prefix = ""
+        if args.adaptive_loss_method == 'dynamic':
+            prefix = f"Dynamic_{args.adaptive_adjust_factor}"
+        elif args.adaptive_loss_method == 'uncertainty':
+            prefix = f"Uncertainty_{args.adaptive_init_log_var}"
+        elif args.adaptive_loss_method == 'autoweight':
+            prefix = "Autoweight"
+        
+        if prefix and prefix not in args.run_name_head:
+            args.run_name_head = f"{prefix}_{args.run_name_head}"
+
     # 如果使用了 PatchCore，且 run_name_head 中没有 MemB，则在 run_name_head 前加上前缀
     if args.use_patchcore and "MemB" not in args.run_name_head:
         args.run_name_head = "MemB_" + args.run_name_head
@@ -175,7 +188,11 @@ def train(args):
         dest=True, 
         ed=True,
         use_d2t=args.use_d2t,
-        use_patchcore=args.use_patchcore
+        use_patchcore=args.use_patchcore,
+        use_afs=args.use_afs,
+        afs_ratio=args.afs_ratio,
+        use_rrs=args.use_rrs,
+        rrs_ratio=args.rrs_ratio
     ).to(device)
 
     # --- 多卡训练支持 (DataParallel) ---
@@ -652,13 +669,23 @@ def train(args):
             # 定期评估模型性能
             # 修改评估策略：仅在分割训练阶段进行定期评估，并在阶段开始和结束时强制评估
             should_run_eval = False
-            if args.val_rod_dir:
-                # 1. 分割阶段开始前 (Phase 1 刚结束)
-                if global_step == args.de_st_steps:
-                    should_run_eval = True
+            
+            # --- Phase 1 结束，Phase 2 开始前 ---
+            if global_step == args.de_st_steps:
+                # 1. 运行 AFS 特征选择 (如果启用)
+                if args.use_afs:
+                    print(f"--- Phase 1 Finished. Running AFS with ratio {args.afs_ratio} ---")
+                    # 使用当前的训练集 dataloader (包含合成异常)
+                    real_model.run_afs(dataloader, device, args.afs_ratio)
+                    # 恢复训练模式
+                    real_model.student_net.eval()
+                    real_model.segmentation_net.train()
                 
+                should_run_eval = True
+            
+            if args.val_rod_dir:
                 # 2. 分割阶段中的周期性评估 或 训练结束时
-                elif global_step > args.de_st_steps:
+                if global_step > args.de_st_steps:
                     steps_in_phase2 = global_step - args.de_st_steps
                     if steps_in_phase2 % args.eval_per_steps == 0 or global_step == args.steps:
                         should_run_eval = True
@@ -832,6 +859,12 @@ if __name__ == "__main__":
     parser.add_argument("--patchcore_ratio", type=float, default=0.01, help="PatchCore 记忆库采样比例")
     parser.add_argument("--memory_bank_source_dir", type=str, default=r"D:\lh\Datasets\ForMyThesis\RodDefect\train\good_75", help="用于构建PatchCore记忆库的原始正常图像(未复制扩充)目录 (通常不包含合成缺陷)")
     parser.add_argument("--use_prebuild_memory_bank", action='store_true', help="是否在训练前使用原始正常图像预构建记忆库 (避免使用增强后的冗余数据)")
+
+    # -- 特征选择策略参数 (AFS & RRS) --
+    parser.add_argument("--use_afs", action="store_true", help="是否启用 AFS (Anomaly Feature Selection) 策略")
+    parser.add_argument("--afs_ratio", type=float, default=0.5, help="AFS 策略保留的特征通道比例 (0~1)")
+    parser.add_argument("--use_rrs", action="store_true", help="是否启用 RRS (Reconstruction Residual Selection) 策略")
+    parser.add_argument("--rrs_ratio", type=float, default=0.5, help="RRS 策略保留的特征通道比例 (0~1)")
 
     # -- 模型与训练超参数 --
     parser.add_argument("--num_classes", type=int, default=4, help="类别数量")    
