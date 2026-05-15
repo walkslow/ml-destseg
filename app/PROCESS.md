@@ -13,6 +13,21 @@
 
 ---
 
+## 2026-05-15 · 步骤 1：应用包与 GUI 依赖入口
+
+**工具**：Codex CLI
+**状态**：已完成
+
+### 决策与偏离
+- 无。按 IMPLEMENTATION.md §5 步骤 1 创建空包文件与独立 GUI 依赖清单。
+
+### 遇到的坑
+- PowerShell 启动时尝试加载未签名 profile，输出执行策略报错；后续命令改用 `login=false`，不影响项目文件。
+- 首次读取 `AGENTS.md` 时终端中文编码显示异常；后续读取项目文档改用 `-Encoding utf8`。
+
+### 下一步
+- 从 IMPLEMENTATION.md §5 **步骤 2** 开始：实现 `app/inference.py`，保持纯计算层、无 Qt 依赖，并先用命令行自检模型加载与单图推理。
+
 ## 模板（复制下面这段开新会话节）
 
 ```markdown
