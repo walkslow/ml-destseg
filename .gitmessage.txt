@@ -1,0 +1,29 @@
+<type>(<scope>): <中文简短说明>
+
+# 正文可选：说明为什么改、做了什么、有什么验证。
+# 每行建议不超过 72 个字符。
+#
+# 格式基于本仓库既有提交记录：
+# - feat(eval): 在可视化保存中添加原始图像保存功能
+# - fix(eval): 重置dataloader的随机种子以确保评估一致性
+# - refactor(rod_dataset): 重构数据集类以支持真实数据和合成数据模式
+# - chore(app): 完成步骤1：初始化应用包与GUI依赖入口
+#
+# type 建议：
+# - feat: 新功能
+# - fix: 修复缺陷
+# - docs: 文档
+# - refactor: 重构，不改变外部行为
+# - chore: 工程杂项、依赖、配置、接力步骤
+# - test: 测试
+#
+# scope 建议使用主要影响模块或目录：
+# - app / train / eval / model / data / draw / docs
+#
+# 示例：
+# feat(app): 实现CPU推理计算层
+#
+# 可选正文示例：
+# - 复用 DeSTSeg 与 MemoryBank，强制 map_location="cpu"
+# - 添加单图预处理、前向推理和三视图渲染
+# - 验证：python -c "from app.inference import InferenceEngine"
