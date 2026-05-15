@@ -13,6 +13,23 @@
 
 ---
 
+## 2026-05-15 · 步骤 2：CPU 推理计算层
+
+**工具**：Codex CLI
+**状态**：已完成
+
+### 决策与偏离
+- 在 `app/inference.py` 中同时提供 `InferenceEngine` 与 `python -m app.inference <png>` CLI 自检入口；仍保持纯计算层，不引入 Qt / PySide6。
+- 默认 checkpoint 未包含当前模型定义新增的 `channel_mask` buffer；加载侧仅允许缺失这一项，沿用模型初始化的全 1 buffer，其他 state_dict 差异仍然报错。
+- 未修改 `AGENTS.md` 的粗粒度勾选框，因为该文件位于 `app/` 外；如需同步勾选，后续单独确认后再改。
+
+### 遇到的坑
+- `DeSTSeg` 当前分割输出为 `64×64`，而 GUI 首版展示固定 `256×256`；计算层按 `eval.py` 的保险逻辑先插值回输入尺寸再 `argmax`，避免叠加图尺寸不一致。
+- 本地 git 写 `.git/index.lock` 需要提升权限；提交阶段需用已授权的 git 前缀或重新批准。
+
+### 下一步
+- 从 IMPLEMENTATION.md §5 **步骤 3** 开始：实现 `app/workers.py`，用 QThread Worker 包装 `InferenceEngine.load()` 与 `InferenceEngine.predict()`。
+
 ## 2026-05-15 · 步骤 1：应用包与 GUI 依赖入口
 
 **工具**：Codex CLI
