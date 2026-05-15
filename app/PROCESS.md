@@ -13,6 +13,21 @@
 
 ---
 
+## 2026-05-15 · 步骤 2 补充：推理层中文注释与 docstring
+
+**工具**：Codex CLI
+**状态**：已完成
+
+### 决策与偏离
+- 按用户要求，为 `app/inference.py` 补充详细中文模块 docstring、类 docstring、函数 docstring 和关键路径注释。
+- 这是可读性补充，不改变推理行为和对外接口。
+
+### 遇到的坑
+- 模块级 docstring 必须位于 `from __future__ import annotations` 之前，否则不会成为模块 `__doc__`。
+
+### 下一步
+- 后续新写 Python 文件时继续添加详细中文注释和 docstring；如需让其他工具也自动遵守，建议把该约定同步进根目录 `AGENTS.md`。
+
 ## 2026-05-15 · 步骤 2：CPU 推理计算层
 
 **工具**：Codex CLI
