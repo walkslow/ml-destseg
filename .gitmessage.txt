@@ -1,6 +1,6 @@
 <type>(<scope>): <中文简短说明>
 
-# 正文可选：说明为什么改、做了什么、有什么验证。
+# 正文建议填写：按文件或模块说明做了哪些改动、为什么改、有什么验证。
 # 每行建议不超过 72 个字符。
 #
 # 格式基于本仓库既有提交记录：
@@ -24,6 +24,12 @@
 # feat(app): 实现CPU推理计算层
 #
 # 可选正文示例：
+# app/inference.py:
 # - 复用 DeSTSeg 与 MemoryBank，强制 map_location="cpu"
 # - 添加单图预处理、前向推理和三视图渲染
-# - 验证：python -c "from app.inference import InferenceEngine"
+#
+# app/PROCESS.md:
+# - 记录本次实现决策、兼容处理和下一步交接
+#
+# 验证：
+# - python -c "from app.inference import InferenceEngine"
