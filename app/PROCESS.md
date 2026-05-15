@@ -13,6 +13,21 @@
 
 ---
 
+## 2026-05-15 · 步骤 3：后台 Worker 封装
+
+**工具**：Codex CLI
+**状态**：已完成
+
+### 决策与偏离
+- 按 IMPLEMENTATION.md §4.2 的模板实现 `ModelLoadWorker` 与 `InferenceWorker`，只负责把 `InferenceEngine.load()` / `predict()` 放入 `QThread` 子线程并通过信号回传结果或异常。
+- Worker 层保持“薄包装”，不接触 GUI 控件、不管理线程生命周期、不引入额外业务逻辑。
+
+### 遇到的坑
+- 无。该步骤严格沿用实施文档中的信号签名与调用顺序。
+
+### 下一步
+- 从 IMPLEMENTATION.md §5 **步骤 4** 开始：实现 `app/main_window.py`，接入三视图布局、按钮、状态栏和 Worker 调度。
+
 ## 2026-05-15 · 步骤 2 补充：推理层中文注释与 docstring
 
 **工具**：Codex CLI
